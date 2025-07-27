@@ -1,0 +1,34 @@
+﻿# FastAPI関連
+fastapi
+uvicorn[standard]
+pydantic
+
+# LangChain関連
+langchain
+langchain-core
+langchain-community
+langchain-openai
+langchain-chroma
+
+# ChromaDB
+chromadb
+
+# その他
+openai
+tiktoken
+pypdf
+pymupdf
+python-dotenv
+tqdm
+
+# Azure Form Recognizer
+azure-core
+azure-common
+azure-ai-formrecognizer
+
+# azure 名前空間の初期化（←メタパッケージではなく空のパッケージ）
+azure-nspkg==3.0.2
+
+pinecone
+
+fastapi
