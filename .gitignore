@@ -167,7 +167,6 @@ cython_debug/
 
 # Output files
 output/
-*.txt
 *.pdf
 
 # Claude AI files
@@ -175,4 +174,9 @@ output/
 
 # Temporary files
 *.tmp
-*.temp 
+*.temp
+
+# Explicitly include important files
+!requirements.txt
+!README.md
+!env.example 
