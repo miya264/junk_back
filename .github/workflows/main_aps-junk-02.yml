@@ -28,12 +28,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ✅ .env を作成（SecretsからOPENAI_API_KEYを渡す）
+      # ✅ .env ファイルを作成（GitHub Secret から）
       - name: Create .env file
         run: |
           echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" > .env
 
-      # ✅ アップロード対象に .env を含める（venv 除外）
+      # ✅ venvを除外してアップロード
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
