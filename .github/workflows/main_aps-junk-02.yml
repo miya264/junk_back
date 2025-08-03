@@ -28,12 +28,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ✅ .env ファイルを作成（GitHub Secret から）
-      - name: Create .env file
-        run: |
-          echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" > .env
+      # .env ファイルは不要になるため削除します
+      # - name: Create .env file
+      #   run: |
+      #     echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" > .env
 
-      # ✅ venvを除外してアップロード
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
@@ -59,3 +58,7 @@ jobs:
           app-name: 'aps-junk-02'
           slot-name: 'Production'
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_2A35EFA5D0F542E9AE507489C5B29354 }}
+          # ここで環境変数を渡します
+          # app-settings: '<名前>=<値>' の形式で指定
+          # 複数の場合は、スペース区切りで指定
+          app-settings: 'OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}'
