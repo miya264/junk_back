@@ -39,7 +39,7 @@ jobs:
         with:
           name: python-app
           path: |
-            .
+            release.zip
             !venv/
 
   deploy:
@@ -51,6 +51,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: python-app
+
+      - name: Unzip artifact for deployment
+        run: unzip release.zip
       
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
