@@ -66,11 +66,41 @@ def reextract_charts_only(split_dir: str, llm: ChatOpenAI, output_path: str):
 
     print(f"✅ 図表出力完了: {output_path}")
 
+def split_pdf_per_page(pdf_path: str, split_dir: str) -> list:
+    import fitz
+    os.makedirs(split_dir, exist_ok=True)
+    doc = fitz.open(pdf_path)
+    split_paths = []
+    for i in range(len(doc)):
+        new_doc = fitz.open()
+        new_doc.insert_pdf(doc, from_page=i, to_page=i)
+        split_path = os.path.join(split_dir, f"page_{i + 1}.pdf")
+        new_doc.save(split_path)
+        new_doc.close()
+        split_paths.append(split_path)
+    return split_paths
+
+
+def process_all_pdfs_for_charts(text_folder: str, output_dir: str, llm: ChatOpenAI):
+    pdf_files = [f for f in os.listdir(text_folder) if f.lower().endswith('.pdf')]
+    if not pdf_files:
+        print("PDFファイルが見つかりませんでした。")
+        return
+    for pdf_file in pdf_files:
+        pdf_path = os.path.join(text_folder, pdf_file)
+        base_name = os.path.splitext(pdf_file)[0]
+        split_dir = os.path.join(output_dir, f"split_pages_{base_name}")
+        split_pdf_per_page(pdf_path, split_dir)
+        output_path = os.path.join(output_dir, f"charts_only_{base_name}.md")
+        print(f"\n=== {pdf_file} の図表抽出を開始 ===")
+        reextract_charts_only(split_dir=split_dir, llm=llm, output_path=output_path)
+        print(f"✅ {pdf_file} の図表抽出完了: {output_path}\n")
+
 # === 実行例 ===
 if __name__ == "__main__":
-    reextract_charts_only(
-        split_dir="output/split_pages",
-        llm=llm,
-        output_path="output/charts_only_reextract.md"
+    process_all_pdfs_for_charts(
+        text_folder="../backend/text",  # 必要に応じてパス調整
+        output_dir="output",
+        llm=llm
     )
 
