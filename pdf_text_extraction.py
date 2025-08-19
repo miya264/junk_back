@@ -98,8 +98,37 @@ def extract_and_restructure_pdf(pdf_path: str, start_page: int = 1) -> None:
 
     print("✅ 処理完了！output/output.txt と output/output.md を確認してください。")
 
+def process_all_pdfs_in_folder(folder_path: str):
+    """
+    指定フォルダ内の全PDFを一括で処理し、output/配下にファイルごとにテキスト・Markdownを保存する
+    """
+    pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.pdf')]
+    if not pdf_files:
+        print("PDFファイルが見つかりませんでした。")
+        return
+
+    for pdf_file in pdf_files:
+        pdf_path = os.path.join(folder_path, pdf_file)
+        print(f"\n=== {pdf_file} の処理を開始 ===")
+        all_pages = split_pdf_per_page(pdf_path)
+        raw_texts = []
+        markdown_results = []
+        for i, page_path in enumerate(tqdm(all_pages, desc=f"{pdf_file}のページ処理中")):
+            page_num = i + 1
+            extracted_text, markdown = analyze_pdf_page_local(page_path, page_num)
+            raw_texts.append(f"## ページ{page_num}\n{extracted_text}")
+            markdown_results.append(markdown)
+        # ファイル名ベースで保存
+        base_name = os.path.splitext(pdf_file)[0]
+        with open(os.path.join(OUTPUT_DIR, f"{base_name}.txt"), 'w', encoding='utf-8') as raw_file:
+            raw_file.write('\n\n'.join(raw_texts))
+        with open(os.path.join(OUTPUT_DIR, f"{base_name}.md"), 'w', encoding='utf-8') as md_file:
+            md_file.write('\n\n'.join(markdown_results))
+        print(f"✅ {pdf_file} の処理完了！output/{base_name}.txt, output/{base_name}.md を確認してください。\n")
+
 if __name__ == "__main__":
-    extract_and_restructure_pdf("03Hakusyo_part1_chap1_web_compressed (3).pdf", start_page=1)
+    # process_all_pdfs_in_folderを呼び出す
+    process_all_pdfs_in_folder("text")
 
 
 

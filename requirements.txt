@@ -9,6 +9,7 @@ langchain-core
 langchain-community
 langchain-openai
 langchain-chroma
+langgraph
 
 # ChromaDB
 chromadb
@@ -32,3 +33,5 @@ azure-nspkg==3.0.2
 pinecone
 
 fastapi
+
+langgraph
