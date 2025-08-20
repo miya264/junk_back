@@ -7,6 +7,10 @@ import os
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+# ★追加
+import re
+import hashlib
+
 # 環境変数の読み込み
 load_dotenv()
 
@@ -43,6 +47,31 @@ text_splitter = RecursiveCharacterTextSplitter(
     chunk_overlap=int(chunk_size * overlap_ratio)
 )
 
+# ★追加: 章タイトル/部タイトル/任意見出しから出典表示用のタイトルを抽出
+def extract_display_title(text: str, fallback_filename: str) -> str:
+    lines = text.splitlines()
+
+    # a) 「第◯章 …」優先
+    for ln in lines:
+        m = re.match(r'^\s*#{1,6}\s*(第\d+章.*)$', ln)
+        if m:
+            return m.group(1).strip()
+
+    # b) 「第◯部 …」
+    for ln in lines:
+        m = re.match(r'^\s*#{1,6}\s*(第\d+部.*)$', ln)
+        if m:
+            return m.group(1).strip()
+
+    # c) 最初の見出し
+    for ln in lines:
+        m = re.match(r'^\s*#{1,6}\s*(.+)$', ln)
+        if m:
+            return m.group(1).strip()
+
+    # d) 見出しが無ければファイル名（拡張子抜き）
+    return os.path.splitext(fallback_filename)[0]
+
 # 図表単位で分割する関数
 def split_by_figure(md_text: str, filename: str):
     sections = md_text.split("# 第")
@@ -52,6 +81,9 @@ def split_by_figure(md_text: str, filename: str):
             continue
         full_text = "# 第" + section.strip()
 
+        # ★追加: 出典表示用タイトル（日本語）を抽出
+        display_title = extract_display_title(full_text, filename)
+
         # さらに長すぎる図表を分割（図表構造は維持）
         chunks = text_splitter.split_text(full_text)
 
@@ -60,8 +92,10 @@ def split_by_figure(md_text: str, filename: str):
                 page_content=chunk,
                 metadata={
                     "source": filename,
-                    "figure_section": f"figure{i+1}",  # ★ 修正済み
-                    "chunk_index": j
+                    "figure_section": f"figure{i+1}",
+                    "chunk_index": j,
+                    # ★追加: 章タイトルを保持（後で表示用に使う）
+                    "chapter_title": display_title,
                 }
             ))
     return documents
@@ -85,10 +119,11 @@ for md_file in tqdm(md_files, desc="Processing Markdown files", unit="file"):
             # ドキュメントのエンベディングを生成
             embedding = embedding_model.embed_query(doc.page_content)
             
-            # Pineconeに挿入するためのベクターを作成
-            vector_id = f"{doc.metadata['source']}_{doc.metadata['figure_section']}_{doc.metadata['chunk_index']}"
+            # ★変更: PineconeのIDはASCIIのみ → ハッシュで安全に生成
+            raw_id = f"{doc.metadata['source']}_{doc.metadata['figure_section']}_{doc.metadata['chunk_index']}"
+            vector_id = hashlib.md5(raw_id.encode("utf-8")).hexdigest()
             
-            # ベクターをPineconeに挿入
+            # ★変更: metadataに display_title を追加（RAGの出典表示で使用）
             index.upsert(
                 vectors=[{
                     "id": vector_id,
@@ -97,7 +132,8 @@ for md_file in tqdm(md_files, desc="Processing Markdown files", unit="file"):
                         "source": doc.metadata["source"],
                         "figure_section": doc.metadata["figure_section"],
                         "chunk_index": doc.metadata["chunk_index"],
-                        "text": doc.page_content
+                        "text": doc.page_content,
+                        "display_title": doc.metadata["chapter_title"],  # ★追加
                     }
                 }]
             )
