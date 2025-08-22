@@ -20,28 +20,36 @@ jobs:
         with:
           python-version: '3.11'
 
-      # `cd backend`コマンドをすべて削除
       - name: Create and start virtual environment
         run: |
+          cd backend
           python -m venv venv
           source venv/bin/activate
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          cd backend
+          pip install -r requirements.txt
 
-      # 環境変数をリポジトリのルートに直接書き込む
       - name: Create .env from GitHub Secrets
         run: |
+          cd backend
           echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> .env
           echo "PINECONE_API_KEY=${{ secrets.PINECONE_API_KEY }}" >> .env
           echo "PINECONE_ENVIRONMENT=${{ secrets.PINECONE_ENVIRONMENT }}" >> .env
           echo "PINECONE_INDEX_NAME=${{ secrets.PINECONE_INDEX_NAME }}" >> .env
           echo "AZURE_FORM_KEY=${{ secrets.AZURE_FORM_KEY }}" >> .env
           echo "AZURE_FORM_ENDPOINT=${{ secrets.AZURE_FORM_ENDPOINT }}" >> .env
+          echo "DB_HOST=${{ secrets.DB_HOST }}" >> .env
+          echo "DB_USER=${{ secrets.DB_USER }}" >> .env
+          echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" >> .env
+          echo "DB_PORT=${{ secrets.DB_PORT }}" >> .env
+          echo "DB_NAME=${{ secrets.DB_NAME }}" >> .env
 
       - name: Zip artifact for deployment
-        # リポジトリのルートディレクトリを圧縮
-        run: zip -r release.zip . -x "venv/*"
+        run: |
+          cd backend
+          zip -r ../release.zip . -x "venv/*" "langchain_env/*" "__pycache__/*" "*.pyc" ".git/*"
 
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
@@ -67,6 +75,5 @@ jobs:
         with:
           app-name: 'aps-junk-02'
           slot-name: 'Production'
-          # デプロイ対象を現在のディレクトリ（リポジトリのルート）に設定
-          package: '.'
+          package: 'release.zip'
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_BA8986DBAA384799824599F7D4D1DC35 }}
