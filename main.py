@@ -32,14 +32,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
-origins = [
-    # ローカル開発環境のオリジン
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    # デプロイしたフロントエンドのオリジン
-    "https://apps-junk-02.azurewebsites.net",
-    # 必要に応じて他のオリジンを追加
-]
+
 
 # CORS設定
 app.add_middleware(
