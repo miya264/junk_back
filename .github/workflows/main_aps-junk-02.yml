@@ -28,6 +28,15 @@ jobs:
           source venv/bin/activate
           pip install -r requirements.txt
 
+      - name: Create .env from GitHub Secrets
+        run: |
+          echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> .env
+          echo "PINECONE_API_KEY=${{ secrets.PINECONE_API_KEY }}" >> .env
+          echo "PINECONE_ENVIRONMENT=${{ secrets.PINECONE_ENVIRONMENT }}" >> .env
+          echo "PINECONE_INDEX_NAME=${{ secrets.PINECONE_INDEX_NAME }}" >> .env
+          echo "AZURE_FORM_KEY=${{ secrets.AZURE_FORM_KEY }}" >> .env
+          echo "AZURE_FORM_ENDPOINT=${{ secrets.AZURE_FORM_ENDPOINT }}" >> .env
+
       - name: Zip artifact for deployment
         run: zip release.zip ./* -r
 

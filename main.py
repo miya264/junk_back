@@ -60,26 +60,53 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "rag-hakusho")
 
-# モデルの初期化
-embedding_model = OpenAIEmbeddings(
-    openai_api_key=OPENAI_API_KEY,
-    model="text-embedding-3-small",
-    chunk_size=1000,
-)
+# モデルの初期化（環境変数が設定されている場合のみ）
+embedding_model = None
+chat = None
+pc = None
+index = None
 
-chat = ChatOpenAI(
-    openai_api_key=OPENAI_API_KEY,
-    model="gpt-4o-mini",
-    temperature=0.3,
-)
+if OPENAI_API_KEY:
+    try:
+        embedding_model = OpenAIEmbeddings(
+            openai_api_key=OPENAI_API_KEY,
+            model="text-embedding-3-small",
+            chunk_size=1000,
+        )
+        
+        chat = ChatOpenAI(
+            openai_api_key=OPENAI_API_KEY,
+            model="gpt-4o-mini",
+            temperature=0.3,
+        )
+        print("✓ OpenAI models initialized successfully")
+    except Exception as e:
+        print(f"⚠️ Warning: OpenAI initialization failed: {e}")
 
-# Pinecone初期化
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(INDEX_NAME)
+if PINECONE_API_KEY:
+    try:
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        index = pc.Index(INDEX_NAME)
+        print("✓ Pinecone initialized successfully")
+    except Exception as e:
+        print(f"⚠️ Warning: Pinecone initialization failed: {e}")
 
-# 政策立案エージェントシステムの初期化
-policy_system = PolicyAgentSystem(chat, embedding_model, index)
-flexible_policy_system = FlexiblePolicyAgentSystem(chat, embedding_model, index)
+if not OPENAI_API_KEY or not PINECONE_API_KEY:
+    print("⚠️ Warning: Some AI services not available due to missing environment variables")
+
+# 政策立案エージェントシステムの初期化（AI サービスが利用可能な場合のみ）
+policy_system = None
+flexible_policy_system = None
+
+if chat and embedding_model and index:
+    try:
+        policy_system = PolicyAgentSystem(chat, embedding_model, index)
+        flexible_policy_system = FlexiblePolicyAgentSystem(chat, embedding_model, index)
+        print("✓ Policy agent systems initialized successfully")
+    except Exception as e:
+        print(f"⚠️ Warning: Policy agent initialization failed: {e}")
+else:
+    print("⚠️ Warning: Policy agents not available - AI services not initialized")
 
 # =====================
 # MySQL helpers
