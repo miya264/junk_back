@@ -1,37 +1,33 @@
-﻿# FastAPI関連
-fastapi
-uvicorn[standard]
-pydantic
+﻿# Web API フレームワーク
+fastapi>=0.116.1
+uvicorn>=0.35.0
+python-multipart==0.0.6
 
-# LangChain関連
-langchain
-langchain-core
-langchain-community
-langchain-openai
-langchain-chroma
-langgraph
+# 環境変数
+python-dotenv>=1.1.1
 
-# ChromaDB
-chromadb
+# LangChain パッケージ (互換性のある最新セット)
+langchain>=0.2.11
+langchain-community>=0.2.11
+langchain-openai>=0.1.7
 
-# その他
-openai
+# 外部サービス
+openai>=1.24.0
+pinecone-client>=2.2.4
+
+# データ処理
+pydantic>=2.7.4
 tiktoken
 pypdf
 pymupdf
-python-dotenv
 tqdm
+pinecone
 
-# Azure Form Recognizer
+# Azure 関連
 azure-core
 azure-common
 azure-ai-formrecognizer
-
-# azure 名前空間の初期化（←メタパッケージではなく空のパッケージ）
 azure-nspkg==3.0.2
 
-pinecone
-
-fastapi
-
-langgraph
+# データベース
+mysql-connector-python>=8.2.0
