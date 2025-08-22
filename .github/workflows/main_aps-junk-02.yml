@@ -22,18 +22,14 @@ jobs:
 
       - name: Create and start virtual environment
         run: |
-          cd backend
           python -m venv venv
           source venv/bin/activate
 
       - name: Install dependencies
-        run: |
-          cd backend
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Create .env from GitHub Secrets
         run: |
-          cd backend
           echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> .env
           echo "PINECONE_API_KEY=${{ secrets.PINECONE_API_KEY }}" >> .env
           echo "PINECONE_ENVIRONMENT=${{ secrets.PINECONE_ENVIRONMENT }}" >> .env
@@ -47,9 +43,7 @@ jobs:
           echo "DB_NAME=${{ secrets.DB_NAME }}" >> .env
 
       - name: Zip artifact for deployment
-        run: |
-          cd backend
-          zip -r ../release.zip . -x "venv/*" "langchain_env/*" "__pycache__/*" "*.pyc" ".git/*"
+        run: zip -r release.zip . -x "venv/*" "langchain_env/*" "__pycache__/*" "*.pyc" ".git/*" ".github/*"
 
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
@@ -75,5 +69,5 @@ jobs:
         with:
           app-name: 'aps-junk-02'
           slot-name: 'Production'
-          package: 'release.zip'
+          package: '.'
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_BA8986DBAA384799824599F7D4D1DC35 }}
