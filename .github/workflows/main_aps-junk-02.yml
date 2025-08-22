@@ -23,9 +23,6 @@ jobs:
       # ✅ バックエンドディレクトリに移動して依存関係をインストール
       - name: Install dependencies
         run: |
-          cd backend
-          python -m venv venv
-          source venv/bin/activate
           pip install -r requirements.txt
 
       # ✅ .env を backend ディレクトリ内に作成
