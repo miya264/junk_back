@@ -1,6 +1,6 @@
 ﻿# Web API フレームワーク
 fastapi>=0.116.1
-uvicorn>=0.35.0
+uvicorn[standard]>=0.35.0
 python-multipart==0.0.6
 
 # 環境変数
