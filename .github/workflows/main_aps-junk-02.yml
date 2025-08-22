@@ -20,17 +20,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      # `cd backend`コマンドを削除
+      # `cd backend`コマンドをすべて削除
       - name: Create and start virtual environment
         run: |
           python -m venv venv
           source venv/bin/activate
 
       - name: Install dependencies
-        # `cd backend`コマンドを削除
         run: pip install -r requirements.txt
 
-      # `.env`をリポジトリのルートに作成
+      # 環境変数をリポジトリのルートに直接書き込む
       - name: Create .env from GitHub Secrets
         run: |
           echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> .env
@@ -40,16 +39,15 @@ jobs:
           echo "AZURE_FORM_KEY=${{ secrets.AZURE_FORM_KEY }}" >> .env
           echo "AZURE_FORM_ENDPOINT=${{ secrets.AZURE_FORM_ENDPOINT }}" >> .env
 
-      # リポジトリのルートを圧縮してデプロイ用アーティファクトを作成
       - name: Zip artifact for deployment
+        # リポジトリのルートディレクトリを圧縮
         run: zip -r release.zip . -x "venv/*"
 
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
           name: python-app
-          path: |
-            release.zip
+          path: release.zip
 
   deploy:
     runs-on: ubuntu-latest
@@ -69,6 +67,6 @@ jobs:
         with:
           app-name: 'aps-junk-02'
           slot-name: 'Production'
-          # デプロイ対象をリポジトリのルートに設定
+          # デプロイ対象を現在のディレクトリ（リポジトリのルート）に設定
           package: '.'
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_BA8986DBAA384799824599F7D4D1DC35 }}
