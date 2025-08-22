@@ -20,31 +20,33 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ✅ バックエンドディレクトリに移動して依存関係をインストール
-      - name: Install dependencies
+      - name: Create and start virtual environment
         run: |
-          pip install -r requirements.txt
+          python -m venv venv
+          source venv/bin/activate
 
-      # ✅ .env を backend ディレクトリ内に作成
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ✅ ここで .env を作成
       - name: Create .env from GitHub Secrets
         run: |
-          echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> backend/.env
-          echo "PINECONE_API_KEY=${{ secrets.PINECONE_API_KEY }}" >> backend/.env
-          echo "PINECONE_ENVIRONMENT=${{ secrets.PINECONE_ENVIRONMENT }}" >> backend/.env
-          echo "PINECONE_INDEX_NAME=${{ secrets.PINECONE_INDEX_NAME }}" >> backend/.env
-          echo "AZURE_FORM_KEY=${{ secrets.AZURE_FORM_KEY }}" >> backend/.env
-          echo "AZURE_FORM_ENDPOINT=${{ secrets.AZURE_FORM_ENDPOINT }}" >> backend/.env
+          echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> .env
+          echo "PINECONE_API_KEY=${{ secrets.PINECONE_API_KEY }}" >> .env
+          echo "PINECONE_ENVIRONMENT=${{ secrets.PINECONE_ENVIRONMENT }}" >> .env
+          echo "PINECONE_INDEX_NAME=${{ secrets.PINECONE_INDEX_NAME }}" >> .env
+          echo "AZURE_FORM_KEY=${{ secrets.AZURE_FORM_KEY }}" >> .env
+          echo "AZURE_FORM_ENDPOINT=${{ secrets.AZURE_FORM_ENDPOINT }}" >> .env
 
-      # ✅ backend ディレクトリを圧縮してデプロイ用アーティファクトを作成
       - name: Zip artifact for deployment
-        run: zip -r release.zip backend -x "backend/venv/*"
+        run: zip -r release.zip . -x "venv/*"
 
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
           name: python-app
-          path: release.zip
-          retention-days: 1
+          path: |
+            release.zip
 
   deploy:
     runs-on: ubuntu-latest
@@ -64,6 +66,4 @@ jobs:
         with:
           app-name: 'aps-junk-02'
           slot-name: 'Production'
-          # ✅ backend ディレクトリをデプロイ対象として明示
-          package: './backend'
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_BA8986DBAA384799824599F7D4D1DC35 }}
