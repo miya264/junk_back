@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .section { margin: 20px 0; padding: 15px; border: 1px solid #ccc; border-radius: 5px; }
+        textarea { width: 100%; height: 60px; margin: 5px 0; }
+        button { padding: 8px 15px; margin: 5px; }
+        .success { color: green; }
+        .error { color: red; }
+        #result { background: #f5f5f5; padding: 10px; margin: 10px 0; min-height: 100px; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <h1>Project Step Sections API Test</h1>
+    
+    <div class="section">
+        <h3>Create Project</h3>
+        <button onclick="createProject()">Create Test Project</button>
+        <div id="projectResult"></div>
+    </div>
+    
+    <div class="section">
+        <h3>Save Step Sections</h3>
+        <input type="text" id="projectId" placeholder="Project ID" style="width: 100%;">
+        <textarea id="problemContent" placeholder="Problem content">テスト課題の内容</textarea>
+        <textarea id="backgroundContent" placeholder="Background content">テスト背景の内容</textarea>
+        <textarea id="priorityContent" placeholder="Priority content">テスト優先度の内容</textarea>
+        <button onclick="saveStepSections()">Save Step Sections</button>
+    </div>
+    
+    <div class="section">
+        <h3>Get Step Sections</h3>
+        <button onclick="getStepSections()">Get Step Sections</button>
+    </div>
+    
+    <div class="section">
+        <h3>Result</h3>
+        <div id="result"></div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://127.0.0.1:8000';
+        let currentProjectId = '';
+
+        async function createProject() {
+            const resultDiv = document.getElementById('projectResult');
+            const mainResult = document.getElementById('result');
+            
+            try {
+                resultDiv.textContent = 'Creating project...';
+                
+                const response = await fetch(`${API_BASE}/api/projects`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name: 'Frontend Test Project',
+                        description: 'Test project for frontend testing',
+                        owner_coworker_id: 1,
+                        member_ids: [1]
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    currentProjectId = data.id;
+                    document.getElementById('projectId').value = currentProjectId;
+                    resultDiv.innerHTML = `<span class="success">Project created: ${currentProjectId}</span>`;
+                    mainResult.textContent = `Project created successfully:\n${JSON.stringify(data, null, 2)}`;
+                } else {
+                    resultDiv.innerHTML = `<span class="error">Failed: ${JSON.stringify(data)}</span>`;
+                    mainResult.textContent = `Error: ${JSON.stringify(data, null, 2)}`;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `<span class="error">Error: ${error.message}</span>`;
+                mainResult.textContent = `Error: ${error.message}`;
+            }
+        }
+
+        async function saveStepSections() {
+            const projectId = document.getElementById('projectId').value;
+            const problemContent = document.getElementById('problemContent').value;
+            const backgroundContent = document.getElementById('backgroundContent').value;
+            const priorityContent = document.getElementById('priorityContent').value;
+            const result = document.getElementById('result');
+            
+            if (!projectId) {
+                result.textContent = 'Please create a project first or enter a project ID';
+                return;
+            }
+            
+            try {
+                result.textContent = 'Saving step sections...';
+                
+                const requestData = {
+                    project_id: projectId,
+                    step_key: 'analysis',
+                    sections: [
+                        {
+                            section_key: 'problem',
+                            content: problemContent,
+                            label: '課題と裏付け'
+                        },
+                        {
+                            section_key: 'background',
+                            content: backgroundContent,
+                            label: '背景構造の評価'
+                        },
+                        {
+                            section_key: 'priority',
+                            content: priorityContent,
+                            label: '優先度と理由'
+                        }
+                    ]
+                };
+                
+                console.log('Request data:', requestData);
+                
+                const response = await fetch(`${API_BASE}/api/project-step-sections`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(requestData)
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    result.innerHTML = `<span class="success">Step sections saved successfully!</span>\n\n${JSON.stringify(data, null, 2)}`;
+                } else {
+                    result.innerHTML = `<span class="error">Save failed:</span>\n\n${JSON.stringify(data, null, 2)}`;
+                }
+            } catch (error) {
+                result.innerHTML = `<span class="error">Error: ${error.message}</span>`;
+            }
+        }
+
+        async function getStepSections() {
+            const projectId = document.getElementById('projectId').value;
+            const result = document.getElementById('result');
+            
+            if (!projectId) {
+                result.textContent = 'Please create a project first or enter a project ID';
+                return;
+            }
+            
+            try {
+                result.textContent = 'Getting step sections...';
+                
+                const response = await fetch(`${API_BASE}/api/project-step-sections/${projectId}/analysis`);
+                const data = await response.json();
+                
+                if (response.ok) {
+                    result.innerHTML = `<span class="success">Step sections retrieved successfully!</span>\n\n${JSON.stringify(data, null, 2)}`;
+                } else {
+                    result.innerHTML = `<span class="error">Get failed:</span>\n\n${JSON.stringify(data, null, 2)}`;
+                }
+            } catch (error) {
+                result.innerHTML = `<span class="error">Error: ${error.message}</span>`;
+            }
+        }
+    </script>
+</body>
+</html>

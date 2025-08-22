@@ -3,9 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import json
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict
 import os
 from dotenv import load_dotenv
+from pathlib import Path
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.schema import SystemMessage, HumanMessage
@@ -15,9 +16,12 @@ import uuid
 from datetime import datetime
 from policy_agents import PolicyAgentSystem
 from flexible_policy_agents import FlexiblePolicyAgentSystem
+import mysql.connector
+from mysql.connector import Error
 
-# 環境変数の読み込み
-load_dotenv()
+# 環境変数の読み込み（backend/.env を明示的に参照）
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=ENV_PATH, override=False)
 
 app = FastAPI(title="AI Agent API", version="1.0.0")
 
@@ -67,6 +71,34 @@ index = pc.Index(INDEX_NAME)
 # 政策立案エージェントシステムの初期化
 policy_system = PolicyAgentSystem(chat, embedding_model, index)
 flexible_policy_system = FlexiblePolicyAgentSystem(chat, embedding_model, index)
+
+# =====================
+# MySQL helpers
+# =====================
+def _mysql_config():
+    return {
+        'host': os.getenv('DB_HOST'),
+        'port': int(os.getenv('DB_PORT', 3306)),
+        'user': os.getenv('DB_USER'),
+        'password': os.getenv('DB_PASSWORD'),
+        'database': os.getenv('DB_NAME'),
+        'charset': 'utf8mb4',
+    }
+
+def _execute_query(query: str, params: tuple | None = None):
+    conn = mysql.connector.connect(**_mysql_config())
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(query, params or ())
+        if query.strip().upper().startswith('SELECT'):
+            return cur.fetchall()
+        conn.commit()
+        return []
+    finally:
+        try:
+            cur.close()
+        finally:
+            conn.close()
 
 # Pydanticモデル
 class MessageRequest(BaseModel):
@@ -122,8 +154,108 @@ class ChatSession(BaseModel):
     created_at: str
     updated_at: str
 
+class ProjectStepSectionRequest(BaseModel):
+    project_id: str
+    step_key: str
+    sections: List[Dict[str, str]]  # [{"section_key": "problem", "content": "..."}, ...]
+
+class ProjectStepSectionResponse(BaseModel):
+    id: str
+    project_id: str
+    step_key: str
+    section_key: str
+    content: str
+    created_at: str
+    updated_at: str
+
+class CoworkerResponse(BaseModel):
+    id: int
+    name: str
+    position: Optional[str] = None
+    email: str
+    department_name: Optional[str] = None
+
+class ProjectCreateRequest(BaseModel):
+    name: str
+    description: Optional[str] = None
+    owner_coworker_id: int
+    member_ids: List[int] = []
+
+class ProjectResponse(BaseModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+    status: str
+    owner_coworker_id: int
+    owner_name: str
+    members: List[CoworkerResponse]
+    created_at: str
+    updated_at: str
+
+# CRUD操作をインポート
+from DB.mysql_crud import (
+    search_coworkers,
+    create_project,
+    get_project_by_id,
+    get_projects_by_coworker,
+    save_project_step_sections,
+    get_project_step_sections,
+    health_check as db_health_check,
+    CRUDError
+)
+
 # セッション管理（簡易版）
 sessions = {}
+
+# =====================
+# DB utility functions
+# =====================
+def _get_step_id(project_id: Optional[str], step_key: Optional[str]) -> Optional[str]:
+    if not project_id or not step_key:
+        return None
+    rows = _execute_query(
+        "SELECT id FROM policy_steps WHERE project_id = %s AND step_key = %s",
+        (project_id, step_key),
+    )
+    if rows:
+        return rows[0]['id']
+    # なければ作成
+    new_id = str(uuid.uuid4())
+    _execute_query(
+        """
+        INSERT INTO policy_steps (id, project_id, step_key, step_name, order_no, status)
+        VALUES (%s, %s, %s, %s, 1, 'active')
+        """,
+        (new_id, project_id, step_key, step_key.title()),
+    )
+    return new_id
+
+def _ensure_chat_session(session_id: str, project_id: Optional[str], step_key: Optional[str]) -> tuple[str, Optional[str]]:
+    """chat_sessions に存在しなければ作成して session_id と step_id を返す"""
+    # スキーマ上 project_id は NOT NULL なので、未指定ならDB保存はスキップ
+    if not project_id:
+        return session_id, None
+    step_id = _get_step_id(project_id, step_key) if (project_id and step_key) else None
+    _execute_query(
+        """
+        INSERT IGNORE INTO chat_sessions (id, project_id, step_id, title, created_by, created_at, updated_at)
+        VALUES (%s, %s, %s, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """,
+        (session_id, project_id, step_id),
+    )
+    return session_id, step_id
+
+def _save_chat_message(session_id: str, project_id: Optional[str], step_id: Optional[str], role: str, msg_type: str, content: str) -> None:
+    # project_id が無い場合は保存スキップ（スキーマで NOT NULL）
+    if not project_id:
+        return
+    _execute_query(
+        """
+        INSERT INTO chat_messages (id, session_id, project_id, step_id, role, msg_type, content, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+        """,
+        (str(uuid.uuid4()), session_id, project_id, step_id, role, msg_type, content),
+    )
 
 def rerank_documents(query: str, docs: list[Document], chat: ChatOpenAI, top_k: int = 5) -> list[Document]:
     """文書の再ランキング"""
@@ -161,20 +293,15 @@ def rerank_documents(query: str, docs: list[Document], chat: ChatOpenAI, top_k: 
             continue
     return selected
 
-def perform_rag_search(query: str) -> str:
-    """RAG検索を実行し、内容と出典を分離して返す"""
-    print(f"DEBUG: perform_rag_search called with query: {query}")
+def perform_rag_search(query: str) -> tuple[str, list[dict]]:
+    """RAG検索を実行し、回答テキストと出典リストを返す"""
     try:
-        # ベクトル検索
-        print("DEBUG: Starting vector search...")
         query_embedding = embedding_model.embed_query(query)
-        print(f"DEBUG: Query embedding completed, length: {len(query_embedding)}")
         results = index.query(
             vector=query_embedding,
             top_k=15,
             include_metadata=True
         )
-        print(f"DEBUG: Vector search completed, found {len(results['matches'])} matches")
 
         # Documentオブジェクトに変換
         initial_docs = []
@@ -242,10 +369,23 @@ def perform_rag_search(query: str) -> str:
         ]
 
         response = chat.invoke(messages)
-        return response.content.strip()
+
+        # 出典情報の配列を構築
+        sources: list[dict] = []
+        for doc in top_docs:
+            sources.append({
+                "source": doc.metadata.get("source"),
+                "section_title": doc.metadata.get("section_title"),
+                "document_title": doc.metadata.get("document_title"),
+                "year": doc.metadata.get("year"),
+                "page_number": doc.metadata.get("page_number"),
+                "score": doc.metadata.get("score"),
+            })
+
+        return response.content.strip(), sources
         
     except Exception as e:
-        return f"RAG検索中にエラーが発生しました: {str(e)}"
+        return f"RAG検索中にエラーが発生しました: {str(e)}", []
 
 def perform_policy_step(content: str, step: str, context: dict = None) -> str:
     """政策立案ステップ別処理"""
@@ -284,29 +424,45 @@ def perform_normal_chat(content: str, session_id: str = None) -> str:
 async def chat_endpoint(request: MessageRequest):
     """チャットエンドポイント"""
     try:
-        user_message = MessageResponse(
-            id=str(uuid.uuid4()),
-            content=request.content,
-            type="user",
-            timestamp=datetime.now().isoformat(),
-            search_type=request.search_type
-        )
-        
-        print(f"DEBUG: search_type = {request.search_type}")
-        print(f"DEBUG: content = {request.content}")
+        # DB保存: ユーザーメッセージ
+        sid = request.session_id or str(uuid.uuid4())
+        session_id, step_id = _ensure_chat_session(sid, request.project_id, request.flow_step)
+        _save_chat_message(session_id, request.project_id, step_id, 'user', request.search_type or 'normal', request.content)
 
         # 1. RAG検索ボタンが押された場合を最優先で処理
         if request.search_type == "fact":
-            print("DEBUG: Executing RAG search...")
-            ai_content = perform_rag_search(request.content)
+            ai_content, sources = perform_rag_search(request.content)
             
             if request.session_id:
                 flexible_policy_system.add_fact_search_result(request.session_id, ai_content)
-                print(f"DEBUG: Added fact search result to session {request.session_id}")
+
+            # RAG結果をDBに保存（検索クエリ＋出典）
+            try:
+                session_id, step_id = _ensure_chat_session(sid, request.project_id, request.flow_step)
+                # rag_search_results は project_id, step_id が NOT NULL のため、揃っている時のみ保存
+                if request.project_id and step_id:
+                    _execute_query(
+                        """
+                        INSERT INTO rag_search_results
+                          (id, project_id, step_id, session_id, query, result_text, result_json, sources_json, created_by, created_at)
+                        VALUES
+                          (%s, %s, %s, %s, %s, %s, NULL, %s, NULL, CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            str(uuid.uuid4()),
+                            request.project_id,
+                            step_id,
+                            session_id,
+                            request.content,
+                            ai_content,
+                            json.dumps(sources, ensure_ascii=False),
+                        ),
+                    )
+            except Exception as e:
+                print(f"WARN: failed to save rag_search_results: {e}")
 
         # 2. 政策立案ステップのボタンが押された場合
         elif request.flow_step:
-            print(f"DEBUG: Executing flexible policy step: {request.flow_step}")
             session_id = request.session_id or str(uuid.uuid4())
             project_id = request.project_id
             
@@ -335,6 +491,8 @@ async def chat_endpoint(request: MessageRequest):
             timestamp=datetime.now().isoformat(),
             search_type=request.search_type
         )
+        # DB保存: AIメッセージ
+        _save_chat_message(session_id, request.project_id, step_id, 'ai', request.search_type or 'normal', ai_content)
         
         return UTF8JSONResponse(ai_message.dict())
         
@@ -389,6 +547,11 @@ async def flexible_policy_endpoint(request: MessageRequest):
             project_id=project_id,
             full_state=result["full_state"]
         )
+
+        # DB保存: セッション確保とメッセージ保存
+        session_id, step_id = _ensure_chat_session(session_id, project_id, request.flow_step)
+        _save_chat_message(session_id, project_id, step_id, 'user', 'normal', request.content)
+        _save_chat_message(session_id, project_id, step_id, 'ai', 'normal', result["result"]) 
         
         return UTF8JSONResponse(response.dict())
         
@@ -429,6 +592,92 @@ async def create_session():
     
     sessions[session_id] = session
     return session
+
+@app.post("/api/project-step-sections", response_model=List[ProjectStepSectionResponse])
+async def save_step_sections(request: ProjectStepSectionRequest):
+    """プロジェクトステップセクションを保存"""
+    try:
+        print(f"DEBUG: Received request: project_id={request.project_id}, step_key={request.step_key}, sections_count={len(request.sections)}")
+        print(f"DEBUG: Request sections: {request.sections}")
+        
+        saved_sections = save_project_step_sections(request.project_id, request.step_key, request.sections)
+        
+        print(f"DEBUG: Successfully saved {len(saved_sections)} sections")
+        return UTF8JSONResponse([ProjectStepSectionResponse(**section).dict() for section in saved_sections])
+    except CRUDError as e:
+        print(f"DEBUG: CRUDError occurred: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        print(f"DEBUG: Exception occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/project-step-sections/{project_id}/{step_key}", response_model=List[ProjectStepSectionResponse])
+async def get_step_sections(project_id: str, step_key: str):
+    """プロジェクトステップセクションを取得"""
+    try:
+        sections = get_project_step_sections(project_id, step_key)
+        return UTF8JSONResponse([ProjectStepSectionResponse(**section).dict() for section in sections])
+    except CRUDError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/coworkers/search", response_model=List[CoworkerResponse])
+async def search_coworkers_endpoint(q: str = "", department: str = ""):
+    """coworkers検索"""
+    try:
+        coworkers = search_coworkers(q, department)
+        return UTF8JSONResponse([CoworkerResponse(**coworker).dict() for coworker in coworkers])
+    except CRUDError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/projects", response_model=ProjectResponse)
+async def create_project_endpoint(request: ProjectCreateRequest):
+    """プロジェクト作成"""
+    try:
+        project = create_project(
+            request.name, 
+            request.description or "", 
+            request.owner_coworker_id, 
+            request.member_ids
+        )
+        if not project:
+            raise HTTPException(status_code=400, detail="Failed to create project")
+        
+        return UTF8JSONResponse(ProjectResponse(**project).dict())
+    except CRUDError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/projects/{project_id}", response_model=ProjectResponse)
+async def get_project_endpoint(project_id: str):
+    """プロジェクト詳細取得"""
+    try:
+        project = get_project_by_id(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        return UTF8JSONResponse(ProjectResponse(**project).dict())
+    except CRUDError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/projects/by-coworker/{coworker_id}", response_model=List[ProjectResponse])
+async def get_projects_by_coworker_endpoint(coworker_id: int):
+    """coworkerが参加しているプロジェクト一覧取得"""
+    try:
+        projects = get_projects_by_coworker(coworker_id)
+        return UTF8JSONResponse([ProjectResponse(**project).dict() for project in projects])
+    except CRUDError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 async def root():
