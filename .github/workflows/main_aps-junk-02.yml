@@ -1,73 +1,75 @@
-name: Build and deploy Python app to Azure Web App - aps-junk-02
+name: Deploy FastAPI backend to Azure Web App - aps-junk-02
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  build:
+  deploy-backend:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python version
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Create and start virtual environment
+      # 1) Python アプリのルート自動検出
+      - name: Detect Python app root
+        id: detect
+        shell: bash
         run: |
-          python -m venv venv
-          source venv/bin/activate
+          set -euo pipefail
+          echo "Searching for python app root (requirements.txt + main.py/app.py)..."
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+          # よくある候補を先にチェック
+          for d in . api server src app; do
+            if [ -f "$d/requirements.txt" ] && { [ -f "$d/main.py" ] || [ -f "$d/app.py" ]; }; then
+              echo "Found at $d"
+              echo "python_dir=$d" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          done
 
-      - name: Create .env from GitHub Secrets
+          # フォールバック: 広めに検索（深さ3）
+          CANDIDATE=$(find . -maxdepth 3 -type f \( -name "main.py" -o -name "app.py" \) \
+                      -exec dirname {} \; | while read d; do
+                        if [ -f "$d/requirements.txt" ]; then echo "$d"; fi
+                      done | head -n1)
+
+          if [ -z "$CANDIDATE" ]; then
+            echo "ERROR: Could not find a directory containing requirements.txt and main.py/app.py"
+            exit 1
+          fi
+
+          echo "Found at $CANDIDATE"
+          echo "python_dir=$CANDIDATE" >> $GITHUB_OUTPUT
+
+      # 2) （任意）.env を持ち込む場合：App Service のアプリ設定に入れるのが本来推奨
+      - name: (Optional) Write .env into app root
         run: |
-          echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> .env
-          echo "PINECONE_API_KEY=${{ secrets.PINECONE_API_KEY }}" >> .env
-          echo "PINECONE_ENVIRONMENT=${{ secrets.PINECONE_ENVIRONMENT }}" >> .env
-          echo "PINECONE_INDEX_NAME=${{ secrets.PINECONE_INDEX_NAME }}" >> .env
-          echo "AZURE_FORM_KEY=${{ secrets.AZURE_FORM_KEY }}" >> .env
-          echo "AZURE_FORM_ENDPOINT=${{ secrets.AZURE_FORM_ENDPOINT }}" >> .env
-          echo "DB_HOST=${{ secrets.DB_HOST }}" >> .env
-          echo "DB_USER=${{ secrets.DB_USER }}" >> .env
-          echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" >> .env
-          echo "DB_PORT=${{ secrets.DB_PORT }}" >> .env
-          echo "DB_NAME=${{ secrets.DB_NAME }}" >> .env
+          cat > "${{ steps.detect.outputs.python_dir }}/.env" <<'EOF'
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          PINECONE_API_KEY=${{ secrets.PINECONE_API_KEY }}
+          PINECONE_INDEX_NAME=${{ secrets.PINECONE_INDEX_NAME }}
+          DB_HOST=${{ secrets.DB_HOST }}
+          DB_USER=${{ secrets.DB_USER }}
+          DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+          DB_PORT=${{ secrets.DB_PORT }}
+          DB_NAME=${{ secrets.DB_NAME }}
+          EOF
 
-      - name: Zip artifact for deployment
-        run: zip -r release.zip . -x "venv/*" "langchain_env/*" "__pycache__/*" "*.pyc" ".git/*" ".github/*"
+      # 3) ZIP にする場合（中身が“そのディレクトリの中身”になるように）
+      - name: Zip Python app root
+        run: |
+          cd "${{ steps.detect.outputs.python_dir }}"
+          zip -r ../release.zip . -x "__pycache__/*" "*.pyc" ".git/*" ".venv/*"
+          cd -
 
-      - name: Upload artifact for deployment jobs
-        uses: actions/upload-artifact@v4
-        with:
-          name: python-app
-          path: release.zip
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build
-
-    steps:
-      - name: Download artifact from build job
-        uses: actions/download-artifact@v4
-        with:
-          name: python-app
-
-      - name: Unzip artifact for deployment
-        run: unzip release.zip
-
-      - name: 'Deploy to Azure Web App'
+      # 4) デプロイ（ZIP のまま渡すのが安全）
+      - name: Deploy to Azure Web App (zip)
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'aps-junk-02'
           slot-name: 'Production'
-          package: '.'
+          package: release.zip
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_BA8986DBAA384799824599F7D4D1DC35 }}
+          startup-command: 'python -m uvicorn main:app --host 0.0.0.0 --port 8000'
