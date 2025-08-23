@@ -28,15 +28,6 @@ jobs:
           source venv/bin/activate
           pip install -r requirements.txt
 
-      - name: Create .env from GitHub Secrets
-        run: |
-          echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> .env
-          echo "PINECONE_API_KEY=${{ secrets.PINECONE_API_KEY }}" >> .env
-          echo "PINECONE_ENVIRONMENT=${{ secrets.PINECONE_ENVIRONMENT }}" >> .env
-          echo "PINECONE_INDEX_NAME=${{ secrets.PINECONE_INDEX_NAME }}" >> .env
-          echo "AZURE_FORM_KEY=${{ secrets.AZURE_FORM_KEY }}" >> .env
-          echo "AZURE_FORM_ENDPOINT=${{ secrets.AZURE_FORM_ENDPOINT }}" >> .env
-
       - name: Zip artifact for deployment
         run: zip release.zip ./* -r
 
@@ -75,3 +66,14 @@ jobs:
           package: .
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_BA8986DBAA384799824599F7D4D1DC35 }}
           configuration: 'SCM_DO_BUILD_DURING_DEPLOYMENT=true'
+          app-settings: |
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            PINECONE_API_KEY=${{ secrets.PINECONE_API_KEY }}
+            PINECONE_ENVIRONMENT=${{ secrets.PINECONE_ENVIRONMENT }}
+            PINECONE_INDEX_NAME=${{ secrets.PINECONE_INDEX_NAME }}
+            AZURE_FORM_KEY=${{ secrets.AZURE_FORM_KEY }}
+            AZURE_FORM_ENDPOINT=${{ secrets.AZURE_FORM_ENDPOINT }}
+            DB_HOST=${{ secrets.DB_HOST }}
+            DB_USER=${{ secrets.DB_USER }}
+            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+            DB_NAME=${{ secrets.DB_NAME }}
