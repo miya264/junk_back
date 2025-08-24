@@ -1,532 +1,803 @@
+# -*- coding: utf-8 -*-
+
+from typing import Dict, List, Optional, TypedDict, Any
+from datetime import datetime
+import re
+
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain.schema import SystemMessage, HumanMessage
-from langchain_core.documents import Document
-from typing import Dict, List, Optional, TypedDict, Any
-import json
-from datetime import datetime
-import uuid
 
-class FlexiblePolicyState(TypedDict):
-    """柔軟な政策立案プロセスの状態"""
-    session_id: str
-    project_id: Optional[str]
-    analysis_result: Optional[str]
-    objective_result: Optional[str]
-    concept_result: Optional[str]
-    plan_result: Optional[str]
-    proposal_result: Optional[str]
-    last_updated_step: Optional[str]
-    step_dependencies: Dict[str, List[str]]
-    step_timestamps: Dict[str, str]
-    fact_search_results: List[str]
-    conversation_history: List[Dict[str, str]]
+# =========================
+# DB 抽象（既存そのまま）
+# =========================
+class SectionRepo:
+    def get_sections(self, project_id: str, step_key: str) -> List[Dict[str, Any]]:
+        raise NotImplementedError
 
-class FlexiblePolicyAgentSystem:
-    """柔軟な政策立案支援AIエージェントシステム"""
-    
-    def __init__(self, chat_model: ChatOpenAI, embedding_model=None, index=None):
-        self.chat = chat_model
-        self.embedding_model = embedding_model
-        self.index = index
-        
-        # ステップ間の依存関係定義
-        self.step_dependencies = {
-            "analysis": [],
-            "objective": ["analysis"],
-            "concept": ["analysis", "objective"],
-            "plan": ["analysis", "objective", "concept"],
-            "proposal": ["analysis", "objective", "concept", "plan"]
-        }
-        
-        # メモリ内の状態ストレージ（本番では Redis や DB を使用）
-        self.state_storage: Dict[str, FlexiblePolicyState] = {}
-        
-        # 各エージェントメソッドをマッピング
-        self.agent_map = {
-            "analysis": self._analysis_agent,
-            "objective": self._objective_agent,
-            "concept": self._concept_agent,
-            "plan": self._plan_agent,
-            "proposal": self._proposal_agent,
-        }
-    
-    def _get_session_state(self, session_id: str, project_id: str = None) -> FlexiblePolicyState:
-        """セッション状態を取得または初期化"""
-        if session_id not in self.state_storage:
-            self.state_storage[session_id] = FlexiblePolicyState(
-                session_id=session_id,
-                project_id=project_id,
-                analysis_result=None,
-                objective_result=None,
-                concept_result=None,
-                plan_result=None,
-                proposal_result=None,
-                last_updated_step=None,
-                step_dependencies=self.step_dependencies.copy(),
-                step_timestamps={},
-                fact_search_results=[],
-                conversation_history=[]
-            )
-        return self.state_storage[session_id]
-    
-    def _update_session_state(self, session_id: str, step: str, result: str, user_input: str):
-        """セッション状態を更新"""
-        state = self._get_session_state(session_id)
-        
-        # 結果を更新
-        if step == "analysis":
-            state["analysis_result"] = result
-        elif step == "objective":
-            state["objective_result"] = result
-        elif step == "concept":
-            state["concept_result"] = result
-        elif step == "plan":
-            state["plan_result"] = result
-        elif step == "proposal":
-            state["proposal_result"] = result
-        
-        # メタデータを更新
-        state["last_updated_step"] = step
-        state["step_timestamps"][step] = datetime.now().isoformat()
-        
-        # 対話履歴を更新
-        state["conversation_history"].append({"role": "user", "content": user_input})
-        state["conversation_history"].append({"role": "assistant", "content": result})
-        
-        # 履歴が大きくなりすぎないように最新20件程度に制限
-        if len(state["conversation_history"]) > 20:
-            state["conversation_history"] = state["conversation_history"][-20:]
-            
-        self.state_storage[session_id] = state
-    
-    def add_fact_search_result(self, session_id: str, fact_result: str):
-        """ファクト検索結果をセッションに追加"""
-        state = self._get_session_state(session_id)
-        state["fact_search_results"].append(fact_result)
-        self.state_storage[session_id] = state
-    
-    def _get_rag_context(self, query: str) -> List[Document]:
-        """RAG検索でコンテキストを取得（RAG機能の実装は省略）"""
-        # 実際には self.embedding_model と self.index を使用して検索を行う
-        print("RAG検索を実行しました。（ダミー）")
+class CrudSectionRepo(SectionRepo):
+    def __init__(self, crud_module):
+        self.crud = crud_module
+
+    def get_sections(self, project_id: str, step_key: str) -> List[Dict[str, Any]]:
+        if hasattr(self.crud, "fetch_project_step_sections"):
+            return self.crud.fetch_project_step_sections(project_id, step_key)
+        if hasattr(self.crud, "get_project_step_sections"):
+            return self.crud.get_project_step_sections(project_id, step_key)
         return []
 
-    def _build_context_for_step(self, state: FlexiblePolicyState, current_step: str) -> str:
-        """指定されたステップ用のコンテキストを構築"""
-        context_parts = []
-        
-        # ファクト検索結果を追加
-        if state["fact_search_results"]:
-            fact_context = "\\n\\n".join(state["fact_search_results"][-3:])
-            context_parts.append(f"【参考：ファクト検索結果】\\n{fact_context}")
-        
-        # 依存するステップの結果を取得
-        dependencies = self.step_dependencies.get(current_step, [])
-        for dep_step in dependencies:
-            result = state.get(f"{dep_step}_result")
-            if result:
-                step_title = ""
-                if dep_step == "analysis": step_title = "現状分析・課題整理"
-                elif dep_step == "objective": step_title = "目的整理"
-                elif dep_step == "concept": step_title = "コンセプト策定"
-                elif dep_step == "plan": step_title = "施策立案"
-                elif dep_step == "proposal": step_title = "資料作成"
-                context_parts.append(f"【これまでの検討内容：{step_title}】\\n{result}")
+class ChatRepo:
+    def get_recent_messages(self, session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        raise NotImplementedError
 
-        # 直近の対話履歴を追加
-        if state["conversation_history"]:
-            history_context = ""
-            for msg in state["conversation_history"][-10:]:
-                history_context += f"【{msg['role']}】: {msg['content']}\\n"
-            context_parts.append(f"【これまでの対話履歴】\\n{history_context}")
-            
-        return "\\n\\n".join(context_parts) if context_parts else ""
+class CrudChatRepo(ChatRepo):
+    def __init__(self, crud_module):
+        self.crud = crud_module
 
-    def _classify_user_intent(self, user_input: str, state: FlexiblePolicyState) -> str:
-        """
-        ユーザーの入力意図を分類する内部ツール
-        - 'step_action': 特定の政策立案ステップ（analysis, objectiveなど）に関する対話
-        - 'fact_search_request': ファクト検索結果の整理・要約の要求
-        - 'summary_request': これまでの議論の整理・要約の要求
-        - 'other': その他（雑談など）
-        """
-        messages = [
-            SystemMessage(content="あなたはユーザーの入力意図を分類するAIです。選択肢の中から最も適切な分類名を一つだけ出力してください。"),
-            HumanMessage(content=f"""以下のユーザーの入力が、次のどの意図に該当するかを判断してください。
-<選択肢>
-- 'step_action': 既存の政策立案ステップ（現状分析、目的整理、施策立案など）に関する議論の継続。
-- 'fact_search_request': ファクト検索で得た情報の要約や整理を求めている。
-- 'summary_request': これまでの全体の議論の要約や整理を求めている。
-- 'other': 上記以外の一般的な質問や雑談。
+    def get_recent_messages(self, session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        if hasattr(self.crud, "get_recent_chat_messages"):
+            return self.crud.get_recent_chat_messages(session_id, limit)
+        return []
 
-ユーザーの入力:
-{user_input}
+# =========================
+# ステップ定義（ゴールはスコープを厳格化）
+# =========================
+STEP_ORDER = ["analysis", "objective", "concept", "plan", "proposal"]
 
-最も適切な分類名（'step_action', 'fact_search_request', 'summary_request', 'other'）を一つだけ出力してください。
-"""
+# ステップ名 → step_key のゆるいマッチ（日本語/英語/省略語）
+STEP_NAME_ALIASES = {
+    "analysis": ["現状分析", "課題整理"],
+    "objective": ["目的整理"],
+    "concept": ["コンセプト"],
+    "plan": ["施策検討", "施策立案"],
+    "proposal": ["提案資料", "資料作成"],
+}
+
+
+STEP_SECTIONS = {
+    "analysis": [
+        {"key": "problem_evidence",     "label": "課題と裏付け（定量・定性）"},
+        {"key": "background_structure", "label": "課題の背景にある構造（制度・市場など）"},
+        {"key": "priority_reason",      "label": "解決すべき課題の優先度と理由"},
+    ],
+    "objective": [
+        {"key": "final_goal",  "label": "最終的に達成したいゴール"},
+        {"key": "kpi_target",  "label": "KPI・目標値（いつまでに・どれだけ）"},
+        {"key": "constraints", "label": "前提条件・制約（予算・人員・期間など）"},
+    ],
+    "concept": [
+        {"key": "policy_direction", "label": "基本方針（価値/誰に/どう）"},
+        {"key": "evidence",         "label": "方針の根拠・示唆"},
+        {"key": "risks_actions",    "label": "主要リスクと打ち手"},
+    ],
+    "plan": [
+        {"key": "main_actions", "label": "主な施策（3〜5）と狙い"},
+        {"key": "org_schedule", "label": "体制・役割分担・スケジュール"},
+        {"key": "cost_effect",  "label": "概算コスト・効果見込み"},
+    ],
+    "proposal": [
+        {"key": "exec_summary",    "label": "提案サマリー（背景→課題→解決→効果→体制）"},
+        {"key": "decision_points", "label": "意思決定者の関心（費用対効果・リスク・責任）"},
+        {"key": "next_actions",    "label": "次のアクション（承認/説明/PoC）"},
+    ],
+}
+
+STEP_CONFIG = {
+    "analysis": {
+        "title": "現状分析・課題整理",
+        "goals": [
+            "課題と裏付け（定量/定性）が示されている",
+            "背景にある構造（制度・市場・慣行など）が仮説化されている",
+            "優先度と着手順が説明できる",
+        ],
+        # 重要：ここでは施策検討に入らない指示を明記
+        "persona": (
+            "課題整理と現状分析の専門家。自然体の敬体で伴走。断定しすぎない。"
+            " このフェーズでは施策/解決案の詳細には入らず、現状の把握と課題の特定・裏付けに専念する。"
+            " 解決策に言及する場合は“仮に”レベルでとどめ、詳細検討は後工程へ明示的に保留する。"
+        ),
+        "stay_in_lane": True,
+    },
+    "objective": {
+        "title": "目的整理",
+        "goals": [
+            "最終ゴール（誰がどう変わるか）が具体",
+            "KPI/目標値（いつまでに・どれだけ）が根拠付きで定義",
+            "前提条件・制約が列挙され、柔軟性が検討済み",
+        ],
+        "persona": "目的とKPI設定の専門家。まず“誰がどう変わるか”の言語化を支援。",
+        "stay_in_lane": True,
+    },
+    "concept": {
+        "title": "コンセプト策定",
+        "goals": [
+            "どんな価値を誰にどう届けるかが明確",
+            "根拠（調査/事例/専門家）がある",
+            "主要リスクと軽減策（代替案・小規模実験）がある",
+        ],
+        "persona": "政策コンセプトとリスク評価の専門家。反証も扱う。",
+        "stay_in_lane": True,
+    },
+    "plan": {
+        "title": "施策立案",
+        "goals": [
+            "主な施策（3〜5）が目的と整合",
+            "体制/役割/スケジュールが現実的",
+            "概算コストと効果見込み、評価方法がある",
+        ],
+        "persona": "実行計画とコスト/リソース管理の専門家。小さく速く検証。",
+        "stay_in_lane": True,
+    },
+    "proposal": {
+        "title": "資料作成",
+        "goals": [
+            "背景→課題→解決→効果→体制の物語が滑らか",
+            "意思決定者の関心（費用対効果・リスク・責任）をカバー",
+            "承認後の次アクション（PoC等）が明示",
+        ],
+        "persona": "提案資料と意思決定支援の専門家。“要は何か”を短く。",
+        "stay_in_lane": True,
+    },
+}
+
+EXPLICIT_REFERENCE = True
+
+# =========================
+# ゲート閾値
+# =========================
+MIN_TURNS_FOR_STRUCTURE = 3
+MIN_TURNS_FOR_CAPTURE   = 4
+MIN_TURNS_FOR_BRIDGE    = 6
+MIN_CHARS_FOR_CAPTURE   = 120
+MIN_RECENT_CHARS        = 200
+
+# =========================
+# 追加：ファクト提示テンプレ
+# =========================
+# ステップ別：誰に/何を集めると良いかの“具体カテゴリ”ガイダンス（プレースホルダ禁止）
+FACT_GUIDANCE = {
+    "analysis": [
+        # 人（誰に聞くか）
+        "現場オペレーター（例：受発注・窓口・経理補助など）",
+        "現場のリーダー/班長・係長クラス（業務の詰まり所の把握者）",
+        "情報システム/総務・庶務（帳票/ツール/権限の実務を知る人）",
+        "主要な取引先/委託先の担当（FAX/紙依存の理由を持つ相手側）",
+        "商工会・業界団体/地域金融機関（横断的な事情に詳しい組織）",
+        # データ（何を集めるか）
+        "処理時間・処理件数・エラー/差し戻し件数（業務ログ/紙台帳）",
+        "紙・FAX比率、再入力件数、二重入力の発生頻度",
+        "在庫回転・受発注リードタイム・納期遅延率",
+        "問い合わせチャネル別件数（電話/メール/紙/オンライン）",
+        "人員構成・経験年数・研修受講状況（基礎スキル把握）",
+    ],
+    "objective": [
+        # 人
+        "KPIのオーナー/管理者（部門長・経営企画）、データ管理者",
+        "評価を受ける現場側（KPIが業務に与える負荷を確認）",
+        # データ
+        "KPI候補：紙書類比率、再入力率、処理リードタイム、エラー率、教育受講率、システム定着率（MAU/週次利用率）",
+        "計測可能性：取得経路（業務ログ/在庫・会計/CSツール/勤怠）と更新頻度・欠測",
+        "ベンチマーク：類似施策の達成水準、業界統計の中央値",
+    ],
+    "concept": [
+        # 人
+        "想定ターゲットの利用者/中小企業の担当者（価値仮説への共感度）",
+        "専門家/先行事例の担当者（成功・失敗要因の裏取り）",
+        # データ
+        "ユーザー課題の頻度と深刻度、代替手段の満足度/費用",
+        "国内外の先行事例（導入条件・スイッチングコスト・リスク）",
+    ],
+    "plan": [
+        # 人
+        "パイロットに協力可能な現場/地域・IT担当",
+        "外部ベンダ/ツール提供者（見積・PoC条件）",
+        # データ
+        "パイロット設計：対象セグメント、期間、成功指標（例：処理時間/再入力率/定着率）",
+        "概算コスト（初期/運用）と想定効果（時間削減・事故削減・満足度）",
+    ],
+    "proposal": [
+        # 人
+        "意思決定者/財務、リスク管理、現場代表（関心点の擦り合わせ）",
+        # データ
+        "費用対効果（投資回収期間/ROI）、主要リスクの発生確率と影響、体制稼働（FTE）",
+    ],
+}
+
+
+# =========================
+# ヘルパ
+# =========================
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def _two_bullets(text: str) -> str:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return "・（検討中）"
+    outs = []
+    for ln in lines[:2]:
+        outs.append(ln if ln.startswith(("・","-","*","—")) else f"・{ln}")
+    return "\n".join(outs)
+
+def _bullets_any(text: str, limit=3) -> str:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    bulls = [ln for ln in lines if ln.startswith(("・","-","*","—"))]
+    if not bulls:
+        bulls = [f"・{ln}" for ln in lines if not ln.startswith(("#","##"))]
+    return "\n".join(bulls[:limit]) if bulls else ""
+
+def _score(known: str, gaps: str) -> int:
+    sc = 30
+    sc += 30 if len(known) >= 120 else 15
+    sc += 40 if (0 < len(gaps) <= 120) else 20
+    return max(0, min(100, sc))
+
+# 施策/解決案への“はみ出し”検知（特にanalysisで無効化）
+_SOLUTION_WORDS = re.compile(
+    r"(施策|ソリューション|導入|実装|PoC|ロードマップ|KPI改善案|予算配分|体制案|稟議|スケジュール|ツール選定|システム|ツール|IT化|RPA|SaaS|パッケージ)"
+)
+
+
+def _has_solution_leak(text: str) -> bool:
+    return bool(_SOLUTION_WORDS.search(text or ""))
+
+def _scope_guard(step: str, text: str) -> str:
+    """analysis で施策/システム系の語が出たら、やんわり弱めて注意書きを付ける"""
+    if step != "analysis":
+        return text
+    if not _has_solution_leak(text):
+        return text
+
+    # 『導入/実装/システム/ツール…』を『仮に◯◯』へ弱める
+    softened = re.sub(r"(導入|実装|施策|ソリューション|システム|ツール)", r"仮に\1", text)
+
+    note = (
+        "（※ 今は現状と課題の裏付けに専念します。システム/ツール等の具体策は後工程で扱います。"
+        " いまは「誰が/何が/どれくらい/どこで/いつ」を示すファクトの確認・収集に集中しましょう）"
+    )
+    if note not in softened:
+        softened += "\n" + note
+    return softened
+
+
+# =========================
+# 状態
+# =========================
+class FlexiblePolicyState(TypedDict):
+    session_id: str
+    project_id: Optional[str]
+    last_updated_step: Optional[str]
+    step_timestamps: Dict[str, str]
+    conversation_history: List[Dict[str, str]]   # [{role, content}]
+    ask_cooldown: int
+    last_move: str
+    step_completion: Dict[str, int]              # 進捗スコア（0-100）
+    last_result: Optional[str]
+
+# =========================
+# 本体
+# =========================
+class FlexiblePolicyAgentSystem:
+    """
+    - 自然会話：要約→示唆→軽い確認/提案（最大5文）
+    - 自動ミニ整理：見えている/足りない/次の一歩/（NEW）必要なファクト/収集方法
+    - 保存促し：材料が十分な時のみ、保存先セクションを明示
+    - 横断前提：全ステップの保存済み内容を圧縮して文脈注入
+    - スコープ遵守：analysis では施策詳細へ踏み込まない（ガード）
+    """
+
+    def __init__(self, chat_model: ChatOpenAI, section_repo: Optional[SectionRepo]=None, chat_repo: Optional[ChatRepo]=None):
+        self.chat = chat_model
+        self.section_repo = section_repo
+        self.chat_repo = chat_repo
+        self.state_storage: Dict[str, FlexiblePolicyState] = {}
+
+    # -------- 状態 ------
+    def _get_state(self, session_id: str, project_id: Optional[str]) -> FlexiblePolicyState:
+        st = self.state_storage.get(session_id)
+        if not st:
+            st = FlexiblePolicyState(
+                session_id=session_id,
+                project_id=project_id,
+                last_updated_step=None,
+                step_timestamps={},
+                conversation_history=[],
+                ask_cooldown=0,
+                last_move="advise",
+                step_completion={k: 0 for k in STEP_ORDER},
+                last_result=None,
             )
-        ]
-        response = self.chat.invoke(messages)
-        intent = response.content.strip().replace("'", "").replace('"', '')
-        return intent if intent in ['step_action', 'fact_search_request', 'summary_request', 'other'] else 'step_action'
+            self.state_storage[session_id] = st
+        if project_id and not st.get("project_id"):
+            st["project_id"] = project_id
+        return st
 
-    def _fact_summary_agent(self, user_input: str, state: FlexiblePolicyState) -> str:
-        """ファクト検索結果を整理し、ユーザーに思考を促す専用エージェント"""
-        if not state["fact_search_results"]:
-            return "現在、参照できるファクト検索結果がありません。まずファクト検索ボタンを使って情報を取得してください。"
+    def _turns(self, st: FlexiblePolicyState) -> int:
+        return max(0, len(st["conversation_history"]) // 2)
 
-        fact_context = "\\n\\n".join(state["fact_search_results"][-5:])
-        
-        prompt = PromptTemplate(
-            template="""あなたは政策立案の壁打ち相手です。ユーザーがファクト検索で得た情報をもとに、次の対話を促す役割を担います。単に情報を要約するだけでなく、ユーザーの思考にどう役立つかという視点を加えることが重要です。
+    def _recent_user_chars(self, st: FlexiblePolicyState, last_n_turns: int) -> int:
+        users = [m["content"] for m in st["conversation_history"] if m.get("role")=="user"]
+        return sum(len(t or "") for t in users[-last_n_turns:])
 
-【ファクト検索で得られた情報】
-{fact_context}
+    def _enough(self, st: FlexiblePolicyState, min_turns: int, min_chars: int) -> bool:
+        return (self._turns(st) >= min_turns) and (self._recent_user_chars(st, min_turns) >= min_chars)
 
-【あなたの思考プロセスと振る舞い】
-1.  **情報の要約と整理**: 提供されたファクト情報を簡潔に要約し、要点を箇条書きにする。
-2.  **ユーザーへの問いかけ**: 要約した情報が、ユーザーが現在取り組んでいる課題や仮説とどう関連するかを問いかける。
-3.  **思考の誘導**: 「この情報から、あなたの当初の仮説に何か変更はありますか？」「このデータは、どの課題の裏付けになりそうですか？」といった質問を投げかけ、ユーザーに主体的な思考を促す。
+    def _log_exchange(self, st: FlexiblePolicyState, step: str, user_input: str, result: str):
+        st["last_updated_step"] = step
+        st["step_timestamps"][step] = datetime.now().isoformat()
+        st["conversation_history"].append({"role":"user","content":user_input})
+        st["conversation_history"].append({"role":"assistant","content":result})
+        st["conversation_history"] = st["conversation_history"][-20:]
+        st["last_result"] = result
+        last_move = "ask" if result.strip().endswith(("？","?")) else "advise"
+        st["last_move"] = last_move
+        st["ask_cooldown"] = 2 if last_move=="ask" else max(0, st["ask_cooldown"]-1)
 
-上記を踏まえ、ユーザーの入力を受けたあなたの応答を作成してください。""",
-            input_variables=["fact_context"]
+    # -------- 文脈（横断＋現ステップ詳細） ------
+    def _cross_context(self, st: FlexiblePolicyState) -> str:
+        if not (self.section_repo and st.get("project_id")):
+            return ""
+        blocks = []
+        for step in STEP_ORDER:
+            rows = self.section_repo.get_sections(st["project_id"], step)
+            if not rows:
+                continue
+            ex = []
+            for r in rows:
+                txt = (r.get("content_text") or r.get("content") or "").strip()
+                if not txt: continue
+                ex.append(_clean(txt)[:140])
+            if ex:
+                blocks.append(f"◆{STEP_CONFIG[step]['title']}\n・" + "\n・".join(ex[:3]))
+        return "\n\n".join(blocks)
+
+    def _step_context(self, st: FlexiblePolicyState, step: str) -> str:
+        if not (self.section_repo and st.get("project_id")):
+            return ""
+        rows = self.section_repo.get_sections(st["project_id"], step)
+        if not rows: return ""
+        bl = []
+        for r in rows:
+            txt = (r.get("content_text") or r.get("content") or "").strip()
+            if not txt: continue
+            label = r.get("label") or r.get("section_key","")
+            bl.append(f"■{label}\n{txt[:280]}")
+        return "\n\n".join(bl)
+
+    def _build_context(self, st: FlexiblePolicyState, step: str) -> str:
+        chunks = []
+        hist = st["conversation_history"][-8:]
+        if hist:
+            talk = "\n".join([f"【{m['role']}】{_clean(m['content'])}" for m in hist if m.get("content")])
+            chunks.append("【直近の会話】\n" + talk)
+        cross = self._cross_context(st)
+        if cross:
+            chunks.append("【保存済みの横断前提】\n" + cross)
+        now = self._step_context(st, step)
+        if now:
+            chunks.append("【現在ステップの整理】\n" + now)
+        return "\n\n".join(chunks)
+
+    # -------- 会話生成（自然体＋スコープ明示） ------
+    def _chat_reply(self, step: str, user_input: str, st: FlexiblePolicyState) -> str:
+        cfg = STEP_CONFIG[step]
+        lane_note = " ※このステップの範囲から逸脱しないでください。" if cfg.get("stay_in_lane") else ""
+        # ★ analysis のときだけ強めの禁止文言を追加
+        analysis_guard = (
+            " 特にこの analysis（現状分析・課題整理）では、システムやツール等の導入・実装・施策の詳細には入らないでください。"
+            " 要望があっても丁寧に保留し、現状の事実・課題・根拠（誰が/何が/どれくらい）に集中してください。"
+        ) if step == "analysis" else ""
+
+        sys = (
+            f"あなたは{cfg['persona']}{lane_note}{analysis_guard}"
+            " 出力は自然な会話文のみ（見出し・箇条書きは禁止）。"
+            " 構成は『要約＋共感→示唆/観点を1つ→軽い確認 or 提案を1つ』で合計2〜5文。"
+            " 連続質問は避け、クールダウン中は質問しない。"
+            + (" 可能なら【保存済みの横断前提】または【現在ステップの整理】から該当事項を1点だけ参照し、"
+            "整合しているか/差分がないかをひと言添えてください。矛盾が見つかる場合は、"
+            "『後で確認』ではなく“小さく確認する提案”を短く添えてください。保存内容が無ければ参照は省略します。"
+            if EXPLICIT_REFERENCE else "")
         )
-        
-        messages = [
-            SystemMessage(content="あなたはユーザーの思考を促す壁打ち相手です。得られたファクト検索結果を整理し、ユーザーの考えと照らし合わせるよう促してください。"),
-            HumanMessage(content=prompt.format(fact_context=fact_context))
-        ]
-        
-        response = self.chat.invoke(messages)
-        return response.content.strip()
-
-    def _overall_summary_agent(self, user_input: str, state: FlexiblePolicyState) -> str:
-        """これまでの議論全体を整理し、次のステップを促す専用エージェント"""
-        full_context = ""
-        if state["analysis_result"]:
-            full_context += f"【現状分析・課題整理】\\n{state['analysis_result']}\\n\\n"
-        if state["objective_result"]:
-            full_context += f"【目的整理】\\n{state['objective_result']}\\n\\n"
-        if state["concept_result"]:
-            full_context += f"【コンセプト策定】\\n{state['concept_result']}\\n\\n"
-        if state["plan_result"]:
-            full_context += f"【施策立案】\\n{state['plan_result']}\\n\\n"
-        if state["proposal_result"]:
-            full_context += f"【資料作成】\\n{state['proposal_result']}\\n\\n"
-            
-        if not full_context:
-            return "まだ議論が始まっていないようです。まずは何から始めますか？"
 
         prompt = PromptTemplate(
-            template="""あなたは政策立案の壁打ち相手です。ユーザーの求めに応じて、これまでの議論全体を要約・整理し、現状を共有する役割を担います。単に要約するだけでなく、次の議論をスムーズに進めるための視点を提示することが重要です。
-
-【これまでの議論の全体像】
-{full_context}
-
-【あなたの思考プロセスと振る舞い】
-1.  **全体像の要約**: これまでの議論内容（現状、目的、コンセプト、施策など）を簡潔に箇条書きでまとめる。
-2.  **現状の課題特定**: 議論のどの部分が不足しているか、矛盾はないか、といった「穴」を特定する。
-3.  **次のアクション提案**: ユーザーに「次に何をすべきか」を促すための具体的な質問や提案を投げかける。
-
-上記を踏まえ、ユーザーの入力を受けたあなたの応答を作成してください。""",
-            input_variables=["full_context"]
+            template=(
+                "【ステップ】{title}\n"
+                "【このステップのゴール】\n- " + "\n- ".join(cfg["goals"]) + "\n\n"
+                "【文脈】\n{context}\n\n"
+                "【ユーザーの発話】\n{user_input}\n\n"
+                "会話文だけで返してください。"
+            ),
+            input_variables=["title","context","user_input"],
         )
-        
-        messages = [
-            SystemMessage(content="あなたはユーザーの議論の全体像を整理し、次の行動を促すサポートAIです。"),
-            HumanMessage(content=prompt.format(full_context=full_context))
+        msgs = [
+            SystemMessage(content=sys),
+            HumanMessage(content=prompt.format(title=cfg["title"], context=self._build_context(st, step), user_input=user_input)),
         ]
-        
-        response = self.chat.invoke(messages)
-        return response.content.strip()
+        out = self.chat.invoke(msgs).content.strip()
+        return _scope_guard(step, out)
 
-    def _analysis_agent(self, user_input: str, state: FlexiblePolicyState) -> str:
-        """現状分析・課題整理エージェント（ブラッシュアップ版）"""
-        context = self._build_context_for_step(state, "analysis")
-        
-        prompt = PromptTemplate(
-            template="""あなたは政策立案のプロフェッショナルな壁打ち相手です。ユーザーの思考を構造化し、盲点を指摘し、新たな視点を提供する役割を担います。単なる情報の整理ではなく、ユーザーが気づいていない本質的な課題を発見できるよう導いてください。
+    # -------- ミニ整理（自動/内部用）：ファクト欄を追加 ------
+    def _mini_structure(self, step: str, user_input: str, st: FlexiblePolicyState) -> Dict[str,str]:
+        cfg = STEP_CONFIG[step]
+        # ステップ別ガイダンス（プレースホルダなしのカテゴリ群）
+        guidance_lines = FACT_GUIDANCE.get(step, [])
+        guidance_block = "・" + "\n・".join(guidance_lines) if guidance_lines else ""
 
-【これまでの検討内容】
-{context}
+        analysis_guard = (
+            " 特にこの analysis では、システム/ツール導入などの解決策の詳細には入らず、"
+            " 現状の事実と課題の裏付け（統計/業務ログ/証言/実地観察）に集中してください。"
+        ) if step == "analysis" else ""
 
-【ユーザーからの入力】
-{user_input}
-
-【あなたの思考プロセスと振る舞い】
-1.  **ユーザーの意図理解**: まず、ユーザーの今回の発言が「課題の深掘り」か「単なる現状の羅列」か、その意図を汲み取る。
-2.  **現状の整理**: ユーザーの入力内容を、3つのゴール項目（課題と裏付け、背景にある構造、優先度）に照らし合わせて整理する。
-3.  **対話の方向性提示**: 整理した内容に基づいて、次の対話で深掘りすべき点を「質問」として提示する。
-4.  **問いの具体化**: ユーザーが答えやすいよう、具体的な事例や切り口を交えながら問いを投げかける。答えを直接教えるのではなく、ユーザー自身に考えさせることを徹底する。
-
-【達成すべきゴール】
-この対話を通じて、最終的に以下の3つの項目がまとまることを目指します。
-📋 **1. 課題と裏付け（定量・定性）**
-    ・**確認ポイント**: その課題を裏付けるデータや事実は何ですか？客観的な根拠は十分ですか？
-    ・**投げかけるべき質問例**: 「この課題、例えばどのような数字で示せますか？」「その課題を感じた具体的なエピソードはありますか？」
-
-🏗️ **2. 課題の背景にある構造（制度・市場など）**
-    ・**確認ポイント**: 課題の根本原因は何ですか？制度、社会、市場、文化など、構造的な要因はありますか？
-    ・**投げかけるべき質問例**: 「この問題は、なぜ起こっているのでしょうか？」「なにか法制度や商習慣が影響していませんか？」
-
-🎯 **3. 解決すべき課題の優先度と理由**
-    ・**確認ポイント**: 全ての課題に取り組むのは難しいです。最もインパクトが大きいのはどれですか？
-    ・**投げかけるべき質問例**: 「いくつか課題が見えてきましたが、その中でも特に解決すべき『核』となる課題はどれだとお考えですか？」「その課題から取り組むことで、どのような波及効果が期待できますか？」
-
-上記を踏まえ、ユーザーの入力を受けたあなたの応答を作成してください。""",
-            input_variables=["context", "user_input"]
+        tmpl = PromptTemplate(
+            template=(
+                "あなたは政策立案の壁打ちコーチです。短く要点だけ、箇条書き中心。"
+                " このステップの範囲（スコープ）から逸脱しないでください。"
+                + analysis_guard + "\n"
+                "【ステップ】{title}\n"
+                "【ゴール】\n- " + "\n- ".join(cfg["goals"]) + "\n\n"
+                "【文脈】\n{context}\n\n"
+                "【ユーザーの発話】\n{user_input}\n\n"
+                "次の6ブロックをこの順で出力：\n"
+                "1) TL;DR（1行）\n"
+                "2) 今わかっていること（最大3点）\n"
+                "3) 足りないこと（最大3点）\n"
+                "4) 次の一歩（1つ/担当や期限は書かない/動詞で始める）\n"
+                "5) 必要なファクト（裏付けに必要な客観情報/統計/ログ/文書/実地観察/誰の証言などを自由記述で具体）\n"
+                "6) ファクト収集の提案（誰に何をどう聞くか、どのデータをどこからどう抽出するか/粒度/期間を自由記述で具体）\n"
+                "参考カテゴリ（任意で使う。プレースホルダは禁止）：\n{guidance}\n"
+                "禁止：{{who1}}/{{metric1}} 等のプレースホルダ表記、曖昧な『◯◯など』のみの回答。\n"
+                + ("可能なら、いずれかのブロックに1行だけ『整合メモ：…』を付記して、"
+                "【保存済みの横断前提】または【現在ステップの整理】との整合/差分を示してください。"
+                "保存内容が無ければ付記は省略します。"
+                if EXPLICIT_REFERENCE else "")
+            ),
+            input_variables=["title","context","user_input","guidance"],
         )
-        
-        messages = [
-            SystemMessage(content="あなたは思考整理をサポートする壁打ち相手です。答えや結論は出さず、ユーザーの考えを整理し、気づきを促すことに徹してください。"),
-            HumanMessage(content=prompt.format(context=context, user_input=user_input))
+        msgs = [
+            SystemMessage(content="出力は日本語。各ブロックは見出し＋本文（1〜3行）。このステップの範囲から逸脱しない。"),
+            HumanMessage(content=tmpl.format(
+                title=cfg["title"],
+                context=self._build_context(st, step),
+                user_input=user_input,
+                guidance=guidance_block
+            )),
         ]
-        
-        response = self.chat.invoke(messages)
-        return response.content.strip()
+        raw = self.chat.invoke(msgs).content.strip()
+        raw = _scope_guard(step, raw)
 
-    def _objective_agent(self, user_input: str, state: FlexiblePolicyState) -> str:
-        """目的整理エージェント（ブラッシュアップ版）"""
-        context = self._build_context_for_step(state, "objective")
-        
-        prompt = PromptTemplate(
-            template="""あなたは政策立案のプロフェッショナルな壁打ち相手です。ユーザーの目的が曖昧な状態から、具体的で計測可能なゴールへと磨き上げる役割を担います。単に「何をしたいか」だけでなく、「なぜそれをしたいのか」という本質的な問いを投げかけ、目的の解像度を高めるよう導いてください。
+        # ---- ここから「out」を作って埋める（重要：省略しない）----
+        pats = {
+            "tldr":  r"^\s*1\).*?$([\s\S]*?)(?=^\s*2\)|^\Z)",
+            "known": r"^\s*2\).*?$([\s\S]*?)(?=^\s*3\)|^\Z)",
+            "gaps":  r"^\s*3\).*?$([\s\S]*?)(?=^\s*4\)|^\Z)",
+            "next":  r"^\s*4\).*?$([\s\S]*?)(?=^\s*5\)|^\Z)",
+            "facts": r"^\s*5\).*?$([\s\S]*?)(?=^\s*6\)|^\Z)",
+            "how":   r"^\s*6\).*?$([\s\S]*)\Z",
+        }
+        out: Dict[str, str] = {k: "" for k in pats}
+        for k, pat in pats.items():
+            m = re.search(pat, raw, flags=re.MULTILINE)
+            if m:
+                out[k] = m.group(1).strip()
 
-【これまでの検討内容】
-{context}
+        # ---- フォールバック（空を許さない）----
+        if not out["known"]:
+            out["known"] = _bullets_any(raw, 3)
+        if not out["gaps"]:
+            out["gaps"] = _bullets_any(raw, 3)
+        if not out["facts"]:
+            out["facts"] = "関係者の証言・業務ログ・既存統計・実地観察など、裏付けファクトが未取得。"
+        if not out["how"]:
+            out["how"] = ("現場担当/管理職/情報システム/主要取引先に半構造化インタビュー。"
+                          "業務ログ（処理時間/件数/エラー率）や在庫・受発注データを期間指定で抽出し、"
+                          "チャネル別件数等を集計する。")
+        # 「確認の問い」も用意（呼び出し側で使う）
+        qs = [ln.strip() for ln in raw.splitlines() if ln.strip().endswith(("？", "?"))]
+        out["q"] = qs[-1] if qs else "いま決めるなら、最小の次の一歩は何にしますか？"
 
-【ユーザーからの入力】
-{user_input}
+        # 「次の一歩」が空なら合成
+        if not out["next"]:
+            out["next"] = self._synthesize_next(step, out)
 
-【あなたの思考プロセスと振る舞い】
-1.  **ユーザーの意図理解**: ユーザーの発言が、ゴール設定、KPIの検討、あるいは制約の確認、どの段階にあるかを判断する。
-2.  **目的の明確化**: ユーザーが提示した目的が「最終的にどうなったら成功か」を問い直す。
-3.  **対話の方向性提示**: 3つのゴール項目に沿って、次に深掘りすべきポイントを具体的に提示する。
-4.  **問いの具体化**: 曖昧な表現を避けるための質問（「〜とは具体的にどういうことですか？」）を投げかけ、ユーザーに言語化を促す。
+        if not out["tldr"]:
+            try:
+                out["tldr"] = f"{out['known'].splitlines()[0].lstrip('・-*—').strip()} / {out['next'].splitlines()[0]}"
+            except Exception:
+                out["tldr"] = "要点を整理中。"
 
-【達成すべきゴール】
-この対話を通じて、最終的に以下の3つの項目がまとまることを目指します。
-🎯 **1. 最終的に達成したいゴール**
-    ・**確認ポイント**: 誰にとって、どのような変化をもたらすのか？その変化は具体的にどう測定できるのか？
-    ・**投げかけるべき質問例**: 「『社会の活性化』とは、具体的にどんな状態を指しますか？」「そのゴールは、誰にとって、どんな『嬉しい変化』をもたらしますか？」
+        return out
 
-📊 **2. KPI・目標値（いつまでに・どれだけ）**
-    ・**確認ポイント**: 目標達成度を客観的に評価するための指標は何か？その数値目標の根拠は十分か？
-    ・**投げかけるべき質問例**: 「その目標値は、なぜその数字なのでしょうか？」「目標を達成したかどうかが、第三者にも明確に分かるような指標はありますか？」
-
-⚠️ **3. 前提条件・制約（予算、人員、期間など）**
-    ・**確認ポイント**: 目的達成を阻害する可能性のある制約は何か？それらの制約は本当に動かせないのか？
-    ・**投げかけるべき質問例**: 「この目的を追求する上で、一番大きな『壁』になりそうなものは何でしょう？」「予算や期間について、本当に『〜以内』でないといけませんか？少し柔軟に考えられないでしょうか？」
-
-上記を踏まえ、ユーザーの入力を受けたあなたの応答を作成してください。""",
-            input_variables=["context", "user_input"]
-        )
-        
-        messages = [
-            SystemMessage(content="あなたは思考整理をサポートする壁打ち相手です。答えや結論は出さず、ユーザーの目的設定の思考を整理し、気づきを促すことに徹してください。"),
-            HumanMessage(content=prompt.format(context=context, user_input=user_input))
-        ]
-        
-        response = self.chat.invoke(messages)
-        return response.content.strip()
-
-    def _concept_agent(self, user_input: str, state: FlexiblePolicyState) -> str:
-        """コンセプト策定エージェント（ブラッシュアップ版）"""
-        context = self._build_context_for_step(state, "concept")
-        
-        prompt = PromptTemplate(
-            template="""あなたは政策立案のプロフェッショナルな壁打ち相手です。ユーザーのコンセプトを、曖昧なアイデアから具体的で説得力のある骨子へと磨き上げる役割を担います。単なるコンセプトの羅列ではなく、そのコンセプトが「なぜ有効なのか」という根拠を問い、リスクまで含めて検討を促してください。
-
-【これまでの検討内容】
-{context}
-
-【ユーザーからの入力】
-{user_input}
-
-【あなたの思考プロセスと振る舞い】
-1.  **ユーザーの意図理解**: ユーザーが基本方針、根拠、リスクのどの点について話しているかを把握する。
-2.  **コンセプトの具体化**: ユーザーのアイデアが、誰にどんな価値を届けるのか、その核心部分を明確にする。
-3.  **対話の方向性提示**: 3つのゴール項目に沿って、コンセプトの有効性と実現可能性を検証するための質問を提示する。
-4.  **問いの具体化**: 「そのアイデアが本当に機能するか？」を考えるための具体的な質問（「他の事例ではどうでしたか？」「このリスクは無視できますか？」）を投げかける。
-
-【達成すべきゴール】
-この対話を通じて、最終的に以下の3つの項目がまとまることを目指します。
-💡 **1. 基本方針（どんな価値を誰に、どう届けるか）**
-    ・**確認ポイント**: ターゲット（受益者）は誰か？その人たちに提供する「核となる価値」は何か？その価値を届ける具体的な手段は？
-    ・**投げかけるべき質問例**: 「この施策が最も響くのは、具体的にどんな人たちでしょうか？」「提供する『価値』を、一言で表すとしたら何になりますか？」
-
-📚 **2. 方針の根拠・示唆（調査、事例、専門家意見など）**
-    ・**確認ポイント**: その方針はなぜ成功すると言えるのか？客観的なデータや先行事例、専門家の意見などで裏付けられるか？
-    ・**投げかけるべき質問例**: 「この方針を考えたきっかけは、どんな調査結果や成功事例でしたか？」「類似の取り組みで、失敗したケースから学べることはありませんか？」
-
-⚠️ **3. 主要リスクと打ち手（代替案、実験設計）**
-    ・**確認ポイント**: 想定されるリスクは何か？そのリスクを回避・軽減するための対策は何か？
-    ・**投げかけるべき質問例**: 「もし〇〇という問題が起きた場合、どう対処する予定ですか？」「いきなり大規模に始めるのではなく、小さなパイロット版で検証する方法は考えられますか？」
-
-上記を踏まえ、ユーザーの入力を受けたあなたの応答を作成してください。""",
-            input_variables=["context", "user_input"]
-        )
-        
-        messages = [
-            SystemMessage(content="あなたは思考整理をサポートする壁打ち相手です。答えや結論は出さず、ユーザーのコンセプト検討の思考を整理し、気づきを促すことに徹してください。"),
-            HumanMessage(content=prompt.format(context=context, user_input=user_input))
-        ]
-        
-        response = self.chat.invoke(messages)
-        return response.content.strip()
-
-    def _plan_agent(self, user_input: str, state: FlexiblePolicyState) -> str:
-        """施策立案エージェント（ブラッシュアップ版）"""
-        context = self._build_context_for_step(state, "plan")
-        
-        prompt = PromptTemplate(
-            template="""あなたは政策立案のプロフェッショナルな壁打ち相手です。ユーザーの施策を、絵に描いた餅で終わらせないよう、実行可能性と効果を厳しく検証する役割を担います。計画の穴を見つけ、より現実的で効果的なプランへと磨き上げるよう導いてください。
-
-【これまでの検討内容】
-{context}
-
-【ユーザーからの入力】
-{user_input}
-
-【あなたの思考プロセスと振る舞い】
-1.  **ユーザーの意図理解**: ユーザーの発言が、施策の概要、体制・スケジュール、コスト・効果のどの点に焦点を当てているかを把握する。
-2.  **計画の整合性検証**: ユーザーの施策が、これまでの分析、目的、コンセプトと矛盾していないかを確認する。
-3.  **対話の方向性提示**: 3つのゴール項目に沿って、計画の現実性を高めるための質問を提示する。
-4.  **問いの具体化**: 「それはどうやって実現するのか？」「本当にその効果が出るのか？」といった、実行フェーズを具体的にイメージさせる質問を投げかける。
-
-【達成すべきゴール】
-この対話を通じて、最終的に以下の3つの項目がまとまることを目指します。
-🚀 **1. 主な施策（3〜5個）の概要と狙い**
-    ・**確認ポイント**: 施策はコンセプトに沿っているか？それぞれの施策が、どうやって目的達成に貢献するのか？
-    ・**投げかけるべき質問例**: 「その施策は、想定しているターゲットにどう届きますか？」「なぜその施策が目的達成に不可欠だとお考えですか？」
-
-👥 **2. 体制・役割分担・スケジュール**
-    ・**確認ポイント**: 誰が、いつ、何をするのか、役割は明確か？外部の関係者との連携は考慮されているか？
-    ・**投げかけるべき質問例**: 「この計画を進める上で、特に『協力』が必要になりそうな人や組織は誰でしょうか？」「このスケジュールは、現実的なリソースで実行可能でしょうか？」
-
-💰 **3. 概算コスト・効果見込み（根拠も）**
-    ・**確認ポイント**: 費用と期待効果のバランスはどうか？効果はどのように計測するのか？
-    ・**投げかけるべき質問例**: 「そのコストは、どんな内訳で構成されていますか？」「期待している効果が想定通り出なかった場合、どのように軌道修正しますか？」
-
-上記を踏まえ、ユーザーの入力を受けたあなたの応答を作成してください。""",
-            input_variables=["context", "user_input"]
-        )
-        
-        messages = [
-            SystemMessage(content="あなたは思考整理をサポートする壁打ち相手です。答えや結論は出さず、ユーザーの計画策定の思考を整理し、気づきを促すことに徹してください。"),
-            HumanMessage(content=prompt.format(context=context, user_input=user_input))
-        ]
-        
-        response = self.chat.invoke(messages)
-        return response.content.strip()
-
-    def _proposal_agent(self, user_input: str, state: FlexiblePolicyState) -> str:
-        """資料作成エージェント（ブラッシュアップ版）"""
-        context = self._build_context_for_step(state, "proposal")
-        
-        prompt = PromptTemplate(
-            template="""あなたは政策立案のプロフェッショナルな壁打ち相手です。これまでの議論を、意思決定者が納得し、行動に移したくなるような説得力のある資料にまとめる役割を担います。単なる情報の羅列ではなく、ロジックの飛躍や説明の不足がないか、第三者の視点で厳しくチェックしてください。
-
-【これまでの検討内容】
-{context}
-
-【ユーザーからの入力】
-{user_input}
-
-【あなたの思考プロセスと振る舞い】
-1.  **ユーザーの意図理解**: ユーザーが提案のサマリー、意思決定者へのアピール、次のアクションのどの点について話しているかを把握する。
-2.  **ロジックの穴を見つける**: これまでのステップ（分析→目的→コンセプト→施策）で、話の繋がりが弱い部分や、根拠が不足している点を指摘する。
-3.  **対話の方向性提示**: 3つのゴール項目に沿って、提案の説得力を高めるための質問を提示する。
-4.  **問いの具体化**: 意思決定者の視点に立ち、「この説明で本当に理解してもらえるか？」「懸念点はないか？」といった鋭い質問を投げかける。
-
-【達成すべきゴール】
-この対話を通じて、最終的に以下の3つの項目がまとまることを目指します。
-📝 **1. 提案のサマリー（背景→課題→解決→効果→体制）**
-    ・**確認ポイント**: 物語としての流れはスムーズか？各項目間の因果関係は明確か？
-    ・**投げかけるべき質問例**: 「この背景から、なぜこの課題が導き出されるのか？」「解決策は、提示した課題に直接的に応えるものになっていますか？」
-
-💼 **2. 意思決定者の関心（費用対効果、リスク、責任分担）**
-    ・**確認ポイント**: 意思決定者が最も気にするであろう「お金」と「リスク」について、十分な説明があるか？
-    ・**投げかけるべき質問例**: 「この提案を承認することで、意思決定者にはどんなメリットがありますか？」「もし失敗した場合、誰が、どのように責任を取るか明確になっていますか？」
-
-➡️ **3. 次のアクション（承認プロセス、関係者説明、PoC準備など）**
-    ・**確認ポイント**: 承認を得た後、すぐに何をすべきかが明確か？関係者への説明は準備されているか？
-    ・**投げかけるべき質問例**: 「提案を受け入れる側が、次に具体的に何をすれば良いか、明確に示されていますか？」「この提案に反対する可能性のある関係者はいますか？その人たちには、どう説明しますか？」
-
-上記を踏まえ、ユーザーの入力を受けたあなたの応答を作成してください。""",
-            input_variables=["context", "user_input"]
-        )
-        
-        messages = [
-            SystemMessage(content="あなたは思考整理をサポートする壁打ち相手です。答えや結論は出さず、ユーザーの提案作成の思考を整理し、気づきを促すことに徹してください。"),
-            HumanMessage(content=prompt.format(context=context, user_input=user_input))
-        ]
-        
-        response = self.chat.invoke(messages)
-        return response.content.strip()
-
-    def process_flexible(self, user_input: str, session_id: str, current_step: str, project_id: str = None) -> Dict[str, Any]:
-        """
-        ユーザーの入力を受け付け、意図に応じて処理を振り分けるメインメソッド
-        """
-        state = self._get_session_state(session_id, project_id)
-        
-        # ユーザーの意図を判断
-        intent = self._classify_user_intent(user_input, state)
-        
-        # 意図に応じて処理を分岐
-        if intent == 'fact_search_request' and state["fact_search_results"]:
-            result = self._fact_summary_agent(user_input, state)
-            self._update_session_state(session_id, current_step, result, user_input)
-            return {"result": result, "step": current_step, "type": "fact_summary", "full_state": state}
-            
-        elif intent == 'summary_request':
-            result = self._overall_summary_agent(user_input, state)
-            self._update_session_state(session_id, current_step, result, user_input)
-            return {"result": result, "step": current_step, "type": "overall_summary", "full_state": state}
-
-        # ユーザーが明示的にステップを指定した場合、そちらを優先
-        # 例：「次は目的整理から始めたい」など
-        step_change_request = self._check_step_change_request(user_input)
-        if step_change_request:
-            current_step = step_change_request
-        
-        # 汎用的なタスクに該当しない場合、現在のステップの対話を継続
-        result = self.agent_map[current_step](user_input, state)
-        self._update_session_state(session_id, current_step, result, user_input)
-        return {"result": result, "step": current_step, "type": "step_action", "full_state": state}
     
-    def _check_step_change_request(self, user_input: str) -> Optional[str]:
-        """ユーザーがステップ変更をリクエストしているかを判断"""
-        # 簡易的なキーワードマッチング
-        user_input_lower = user_input.lower()
-        if "現状分析" in user_input or "分析から" in user_input_lower:
-            return "analysis"
-        elif "目的整理" in user_input or "目的から" in user_input_lower:
-            return "objective"
-        elif "コンセプト" in user_input or "コンセプトから" in user_input_lower:
-            return "concept"
-        elif "施策" in user_input or "施策立案" in user_input or "計画" in user_input:
-            return "plan"
-        elif "資料作成" in user_input or "提案書" in user_input:
-            return "proposal"
+    def _synthesize_next(self, step: str, parsed: Dict[str, str]) -> str:
+        # facts/how から一歩を組み立て（会話が薄くても空にならないようにする）
+        def first_line(s: str) -> str:
+            for ln in (s or "").splitlines():
+                t = ln.lstrip("・-*—").strip()
+                if t:
+                    return t
+            return ""
+
+        f = first_line(parsed.get("facts", ""))
+        h = first_line(parsed.get("how", ""))
+
+        if f and h:
+            return f"上位のファクト（例：{f}）を、提案手段（例：{h}）で小さく収集開始する。"
+        if h:
+            return f"提案手段（例：{h}）をスモールテストし、収集可能性と粒度を確認する。"
+        if f:
+            return f"最重要ファクト（例：{f}）の入手先と取得可否を関係者に確認する。"
+
+        # それでも材料が薄い場合のデフォルト（ステップ別）
+        defaults = {
+            "analysis":  "現場1部署を選び、業務フロー観察（半日）＋担当者ヒアリング（15分×2名）を実施する。",
+            "objective": "最終ゴールの草案を1文で作り、関係者2名からフィードバックを得る。",
+            "concept":   "価値提案の1文を作り、想定ターゲット2名に共感度を確認する。",
+            "plan":      "施策候補を3つ列挙し、目的との因果と評価指標の対応表（ラフ）を作る。",
+            "proposal":  "提案サマリー（3行）を作り、決裁者の関心点に沿って推敲する。",
+        }
+        return defaults.get(step, "最小の次の一歩を決める。")
+
+
+    # -------- 保存候補の提示（analysisに事実欄を厚めに） ------
+    def _capture_candidates(self, st: FlexiblePolicyState, step: str, parsed: Dict[str,str]) -> str:
+        if not (self.section_repo and st.get("project_id")):
+            return ""
+        rows = self.section_repo.get_sections(st["project_id"], step)
+        existing = {r["section_key"]: (r.get("content_text") or r.get("content") or "") for r in rows}
+
+        mapping = {
+            "analysis": {
+                "problem_evidence": f"{parsed['known']}\n\n【必要なファクト】\n{parsed['facts']}",
+                "background_structure": parsed["gaps"],
+                "priority_reason": parsed["next"],
+            },
+            "objective": {"final_goal": parsed["known"], "kpi_target": parsed["gaps"], "constraints": parsed["next"]},
+            "concept":   {"policy_direction": parsed["known"], "evidence": parsed["gaps"], "risks_actions": parsed["next"]},
+            "plan":      {"main_actions": parsed["known"], "org_schedule": parsed["gaps"], "cost_effect": parsed["next"]},
+            "proposal":  {"exec_summary": parsed["known"], "decision_points": parsed["gaps"], "next_actions": parsed["next"]},
+        }.get(step, {})
+
+        blocks = []
+        for sec in STEP_SECTIONS.get(step, []):
+            key, label = sec["key"], sec["label"]
+            already = (existing.get(key) or "").strip()
+            draft = (mapping.get(key) or "").strip()
+
+            # ここを修正：空 or 閾値未満でも必ず見出しを出す
+            if already:
+                continue  # 既にDBに保存済みなら候補は出さない
+
+            if not draft or len(draft) < MIN_CHARS_FOR_CAPTURE:
+                draft = "関係者の証言・業務ログ・既存統計・実地観察など、裏付けファクトが未取得。"
+
+            blocks.append(f"### {label}\n{draft}")
+
+        if not blocks:
+            return ""
+        return "— 必要なら、下記を**内容整理**に貼り付けて保存してください。\n" + "\n\n".join(blocks)
+
+
+
+    # -------- 次ステップ橋渡し ------
+    def _bridge(self, current_step: str, score: int, st: FlexiblePolicyState) -> str:
+        """十分に整理できたときだけ、次ステップ名を明示して質問する"""
+        if score < 80:
+            return ""
+        if self._turns(st) < MIN_TURNS_FOR_BRIDGE:
+            return ""
+        idx = STEP_ORDER.index(current_step)
+        if idx >= len(STEP_ORDER) - 1:
+            return ""
+        next_key = STEP_ORDER[idx + 1]
+        next_title = STEP_CONFIG[next_key]["title"]
+        return (
+            f"ここまでの整理は十分に形になってきました。次は「{next_title}」に進みますか？\n"
+            f"（『はい』『進みます』『お願いします』で移動します。続けてこのステップを深掘りする場合は『このまま』等で続行します）"
+        )
+
+
+
+    # -------- メインAPI（既存互換） ------
+    def process_flexible(self, user_input: str, session_id: str, current_step: str, project_id: str=None) -> Dict[str, Any]:
+        # 1) ステップ妥当化
+        if current_step not in STEP_CONFIG:
+            current_step = "analysis"
+        # 2) セッション状態を先に取得（← st を先に用意）
+        st = self._get_state(session_id, project_id)
+
+        # 3) ステップ移動の意図を検出（← ここで st を使う）
+        target_step = self._detect_step_switch_intent(user_input, st, current_step)
+        if target_step and target_step != current_step:
+            msg = f"了解しました。{STEP_CONFIG[target_step]['title']}に移ります。"
+
+            # ★ 移行時にチャット履歴カウントをリセット
+            st["conversation_history"] = []         # 会話履歴クリア
+            st["ask_cooldown"] = 0                  # クールダウン解除
+            st["last_move"] = "advise"              # 状態を初期化
+            st["step_completion"][target_step] = 0  # 新ステップは進捗ゼロから
+            
+            self._log_exchange(st, current_step, user_input, msg)
+            return {
+                "result": msg,
+                "type": "navigate",
+                "step": current_step,
+                "navigate_to": target_step,
+                "progress": st["step_completion"].get(current_step, 0),
+                "full_state": st,
+            }
+
+
+        # 4) 以降は従来ロジック（保存合図→会話→整理…）
+        t = (user_input or "").strip()
+        if t in ["保存した","保存しました","保存完了"] or t.startswith("#保存"):
+            msg = "ありがとうございます。内容が反映されました。この方針で続けますか？それとも修正しますか？"
+            self._log_exchange(st, current_step, user_input, msg)
+            return {"result": msg, "step": current_step, "type": "save_confirm",
+                    "progress": st["step_completion"].get(current_step, 0), "full_state": st}
+
+        # 通常の会話
+        reply = self._chat_reply(current_step, user_input, st)
+
+        # 会話の厚みで自動ミニ整理（ファクト提案込み）
+        tail = ""
+        save_hint = ""
+        bridge = ""
+        progress = st["step_completion"].get(current_step, 0)
+
+        if self._enough(st, MIN_TURNS_FOR_STRUCTURE, MIN_RECENT_CHARS):
+            parsed = self._mini_structure(current_step, user_input, st)
+
+            # ステップの“ゴール達成”に直結するミニ整理＋ファクト提案
+            body = (
+                f"【{STEP_CONFIG[current_step]['title']}の要点】\n"
+                f"見えていること\n{_two_bullets(parsed['known'])}\n\n"
+                f"足りないこと\n{_two_bullets(parsed['gaps'])}\n\n"
+                f"必要なファクト\n{_two_bullets(parsed['facts'])}\n\n"
+                f"収集方法の提案\n{_two_bullets(parsed['how'])}\n\n"
+                f"次の一歩\n{_two_bullets(parsed['next'])}\n\n"
+                f"確認ですが、{parsed.get('q','この方向でよいですか？')}"
+            )
+            tail += "\n\n" + body
+
+            # 保存促し（十分な材料時のみ）
+            if self._enough(st, MIN_TURNS_FOR_CAPTURE, 300):
+                save_hint = self._capture_candidates(st, current_step, parsed)
+                if save_hint:
+                    tail += "\n\n" + save_hint
+
+            # 橋渡し（十分な進捗時のみ）
+            if self._enough(st, MIN_TURNS_FOR_BRIDGE, 450):
+                progress = _score(parsed["known"], parsed["gaps"])
+                st["step_completion"][current_step] = progress
+                bridge = self._bridge(current_step, progress, st)
+                if bridge:
+                    tail += "\n\n" + bridge
+
+        result = reply + (tail if tail else "")
+        self._log_exchange(st, current_step, user_input, result)
+
+        return {
+            "result": result,
+            "step": current_step,
+            "type": "structure" if tail else "chat",
+            "progress": progress,
+            "save_suggestions": save_hint or "",
+            "bridge_suggestion": bridge or "",
+            "full_state": st,
+        }
+    
+        # ---- ユーザー入力から「ステップ移動」の意図を検出 ----
+    def _detect_step_switch_intent(self, user_input: str, st: FlexiblePolicyState, current_step: str) -> Optional[str]:
+        """
+        ステップ名（別名を含む） + 遷移を示す語（命令/希望/依頼）を同時検出して navigate を返す。
+        - 進む系: 移る/進む/行く/切替/… + ください/下さい を含む命令形も許容
+        - 依頼系: 「◯◯（作成/策定/検討）をお願いします」
+        - 戻る系: 「◯◯に戻る/戻ってください」「前のステップに戻る」
+        - 列挙対応: 「コンセプト策定、施策の検討に移ります」→ 動詞の直前に最も近いステップを採用
+        """
+        t = (user_input or "").strip()
+        if not t:
+            return None
+        tl = t.lower()
+
+        # 明示コマンド（例：#移動 objective / #戻る analysis）
+        m = re.search(r"#\s*(?:移動|move|戻る|back)\s+([a-z]+)", tl)
+        if m:
+            key = m.group(1)
+            return key if key in STEP_CONFIG else None
+
+        # 言い回し（命令/希望/依頼）
+        GO_CMDS   = r"(?:移る|移ります|移って(?:ください|下さい)?|進む|進める|進みたい|進んで(?:ください|下さい)?|行く|行きたい|行って(?:ください|下さい)?|切り替える|切替える|切替|切り替えて(?:ください|下さい)?|入る|入りたい|入って(?:ください|下さい)?|開始する|開始したい)"
+        WANT_CMDS = r"(?:したい|やりたい|行いたい|始めたい|取り組みたい|進めたい)"
+        ASK_CMDS  = r"(?:お願いします|お願い致します|お願いいたします|お願い)?"  # 依頼語は単独では無効。必ずステップ語と結合して判定
+        MAKE_NOUN = r"(?:作成|策定|検討)"
+
+        BACK_CMDS = r"(?:戻る|戻ります|戻りたい|戻って(?:ください|下さい)?|戻して(?:ください|下さい)?|戻れます(?:か)?|戻してほしい)"
+
+        # --- ひとつ前に戻る ---
+        if re.search(r"(?:前|ひとつ前|直前)のステップに?\s*" + BACK_CMDS, t):
+            try:
+                idx = STEP_ORDER.index(current_step)
+                if idx > 0:
+                    return STEP_ORDER[idx - 1]
+            except ValueError:
+                pass
+
+        # --- 「◯◯に戻る/戻ってください」 ---
+        for key, aliases in STEP_NAME_ALIASES.items():
+            for a in aliases:
+                a_esc = re.escape(a)
+                pat_back = fr"{a_esc}\s*(?:{MAKE_NOUN})?\s*(?:へ|に)?\s*{BACK_CMDS}"
+                if re.search(pat_back, t):
+                    return key
+
+        # --- 進む／依頼（命令/希望/お願い） ---
+        # ルール：ステップ語（＋作成/策定/検討）＋（へ|に|を|、|空白 可）＋ GO_CMDS or WANT_CMDS or 「…をお願いします」
+        matches: list[tuple[int, str]] = []
+        for key, aliases in STEP_NAME_ALIASES.items():
+            for a in aliases:
+                a_esc = re.escape(a)
+
+                # ① 「◯◯（作成/策定/検討）に進んでください／移る…」
+                pat1 = fr"{a_esc}\s*(?:{MAKE_NOUN})?\s*(?:へ|に)?\s*{GO_CMDS}"
+                # ② 「◯◯（作成/策定/検討）をしたい／行いたい…」
+                pat2 = fr"{a_esc}\s*(?:{MAKE_NOUN})?\s*(?:を|に)?\s*{WANT_CMDS}"
+                # ③ 「次は ◯◯」
+                pat3 = fr"(?:次は|次に)\s*{a_esc}"
+                # ④ 「◯◯（作成/策定/検討）をお願いします」
+                pat4 = fr"{a_esc}\s*(?:{MAKE_NOUN})?\s*(?:を)?\s*お願いします[。!！]?$"
+
+                for pat in (pat1, pat2, pat3, pat4):
+                    for m in re.finditer(pat, t):
+                        matches.append((m.start(), key))
+
+        if matches:
+            # 列挙文対応：動詞の直前/近傍が最後に出たステップであることが多いので、開始位置が最大のものを採用
+            matches.sort(key=lambda x: x[0])
+            return matches[-1][1]
+        
+            # ---- 同意応答 + 直前の橋渡し提案から推定（新規追加）----
+        if re.search(r"^(はい|了解|ok|お願いします|お願いいたします|お願い致します|進みます|次へ|進めよう|お願いします[。!！]?)$", t.strip(), re.IGNORECASE):
+            # 直近のアシスタント発話を取得
+            last_assistant = ""
+            for m in reversed(st["conversation_history"]):
+                if m.get("role") == "assistant":
+                    last_assistant = m.get("content", "")
+                    break
+            if last_assistant:
+                # 1) 『次は「◯◯」に進みますか？』パターン
+                for key in STEP_ORDER:
+                    title = STEP_CONFIG[key]["title"]
+                    if re.search(fr"{re.escape(title)}に進みますか", last_assistant):
+                        return key
+                # 2) 既存フォーマット『次は「◯◯」』にも対応
+                for key in STEP_ORDER:
+                    title = STEP_CONFIG[key]["title"]
+                    if f"次は「{title}」" in last_assistant:
+                        return key
+
+
         return None
 
+
+
+
+
+
+    # 互換エイリアス
+    def process(self, *a, **kw): return self.process_flexible(*a, **kw)
+    def handle(self, *a, **kw):  return self.process_flexible(*a, **kw)
+    def run(self, *a, **kw):     return self.process_flexible(*a, **kw)
+
+    # 状態確認
     def get_session_state(self, session_id: str) -> Dict[str, Any]:
-        """セッション状態を取得"""
-        if session_id not in self.state_storage:
+        st = self.state_storage.get(session_id)
+        if not st:
             return {"error": "セッションが見つかりません"}
-        
-        state = self.state_storage[session_id]
         return {
-            "session_id": session_id,
-            "project_id": state["project_id"],
-            "analysis_result": state["analysis_result"],
-            "objective_result": state["objective_result"],
-            "concept_result": state["concept_result"],
-            "plan_result": state["plan_result"],
-            "proposal_result": state["proposal_result"],
-            "last_updated_step": state["last_updated_step"],
-            "step_timestamps": state["step_timestamps"]
+            "session_id": st["session_id"],
+            "project_id": st["project_id"],
+            "last_updated_step": st["last_updated_step"],
+            "step_timestamps": st["step_timestamps"],
+            "step_completion": st["step_completion"],
         }

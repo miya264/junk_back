@@ -176,6 +176,11 @@ output/
 *.tmp
 *.temp
 
+# Test files and development utilities
+test_*.py
+test_*.html
+Procfile
+
 # Explicitly include important files
 !requirements.txt
 !README.md

@@ -100,8 +100,28 @@ flexible_policy_system = None
 
 if chat and embedding_model and index:
     try:
+        # インポートが必要
+        from flexible_policy_agents import CrudSectionRepo, CrudChatRepo
+        
+        # 既存のDB機能と統合するためのCRUDアダプター
+        class MainCrud:
+            def get_project_step_sections(self, project_id: str, step_key: str):
+                try:
+                    from DB.mysql_crud import get_project_step_sections
+                    return get_project_step_sections(project_id, step_key)
+                except:
+                    return []
+                    
+            def get_recent_chat_messages(self, session_id: str, limit: int = 10):
+                # チャット履歴機能は後で実装
+                return []
+        
+        main_crud = MainCrud()
+        section_repo = CrudSectionRepo(main_crud)
+        chat_repo = CrudChatRepo(main_crud)
+        
         policy_system = PolicyAgentSystem(chat, embedding_model, index)
-        flexible_policy_system = FlexiblePolicyAgentSystem(chat, embedding_model, index)
+        flexible_policy_system = FlexiblePolicyAgentSystem(chat, section_repo, chat_repo)
         print("✓ Policy agent systems initialized successfully")
     except Exception as e:
         print(f"⚠️ Warning: Policy agent initialization failed: {e}")
@@ -164,6 +184,8 @@ class FlexiblePolicyResponse(BaseModel):
     timestamp: str
     session_id: str
     project_id: Optional[str] = None
+    navigate_to: Optional[str] = None  # ステップ移動のターゲット
+    type: Optional[str] = None         # レスポンスタイプ（"navigate"等）
     full_state: Optional[dict] = None
 
 class SessionStateResponse(BaseModel):
@@ -296,7 +318,7 @@ def _save_chat_message(session_id: str, project_id: Optional[str], step_id: Opti
 def rerank_documents(query: str, docs: list[Document], chat: ChatOpenAI, top_k: int = 5) -> list[Document]:
     """文書の再ランキング"""
     prompt = PromptTemplate(
-        input_variables=["query", "documents"],
+        input_variables=["query", "documents", "top_k"],
         template="""
 あなたは優秀な政策アナリストです。以下はユーザーの質問と、その関連として検索された文書のリストです。
 質問に最も関連性の高い上位{top_k}件の文書を選び、番号だけを出力してください。
@@ -308,7 +330,8 @@ def rerank_documents(query: str, docs: list[Document], chat: ChatOpenAI, top_k: 
 
 出力形式（文書番号のみ、例: 0,2,4）:
 """
-    )
+)
+
     
     numbered_docs = []
     for i, doc in enumerate(docs):
@@ -333,29 +356,31 @@ def perform_rag_search(query: str) -> tuple[str, list[dict]]:
     """RAG検索を実行し、回答テキストと出典リストを返す"""
     try:
         query_embedding = embedding_model.embed_query(query)
-        results = index.query(
-            vector=query_embedding,
-            top_k=15,
-            include_metadata=True
-        )
+        results = index.query(vector=query_embedding, top_k=15, include_metadata=True)
 
-        # Documentオブジェクトに変換
+        matches = results.matches if hasattr(results, "matches") else results.get("matches", [])
         initial_docs = []
-        for match in results['matches']:
+        for m in matches:
+            meta  = m.metadata if hasattr(m, "metadata") else m.get("metadata", {}) or {}
+            score = m.score    if hasattr(m, "score")    else m.get("score")
+            text  = meta.get("text") or meta.get("chunk") or meta.get("page_content") or ""
+            if not text:
+                continue
             doc = Document(
-                page_content=match['metadata']['text'],
+                page_content=text,
                 metadata={
-                    'source': match['metadata']['source'],
-                    'figure_section': match['metadata'].get('figure_section', ''),
-                    'chunk_index': match['metadata'].get('chunk_index', ''),
-                    'page_number': match['metadata'].get('page_number', ''),
-                    'section_title': match['metadata'].get('section_title', ''),
-                    'document_title': match['metadata'].get('document_title', ''),
-                    'year': match['metadata'].get('year', ''),
-                    'score': match['score']
-                }
+                    "source": meta.get("source", ""),
+                    "figure_section": meta.get("figure_section", ""),
+                    "chunk_index": meta.get("chunk_index", ""),
+                    "page_number": meta.get("page_number", ""),
+                    "section_title": meta.get("section_title", ""),
+                    "document_title": meta.get("document_title", ""),
+                    "year": meta.get("year", ""),
+                    "score": score,
+                },
             )
             initial_docs.append(doc)
+
 
         # 再ランキング
         top_docs = rerank_documents(query, initial_docs, chat, top_k=5)
@@ -469,7 +494,7 @@ async def chat_endpoint(request: MessageRequest):
         if request.search_type == "fact":
             ai_content, sources = perform_rag_search(request.content)
             
-            if request.session_id:
+            if request.session_id and flexible_policy_system and hasattr(flexible_policy_system, "add_fact_search_result"):
                 flexible_policy_system.add_fact_search_result(request.session_id, ai_content)
 
             # RAG結果をDBに保存（検索クエリ＋出典）
@@ -581,6 +606,8 @@ async def flexible_policy_endpoint(request: MessageRequest):
             timestamp=datetime.now().isoformat(),
             session_id=session_id,
             project_id=project_id,
+            navigate_to=result.get("navigate_to"),  # ステップ移動情報
+            type=result.get("type"),                # レスポンスタイプ
             full_state=result["full_state"]
         )
 

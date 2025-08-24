@@ -223,6 +223,62 @@ class MySQLCRUD:
             return {'status':'healthy','database':'MySQL','table_counts':counts}
         except Exception as e:
             return {'status':'unhealthy','database':'MySQL','error':str(e)}
+        
+    def fetch_project_step_sections(self, project_id: str, step_key: str) -> List[Dict[str, Any]]:
+        """
+        policy_steps.step_key をキーに、そのステップ配下の project_step_sections を
+        ラベル付きで取得（エージェントの SectionRepo 想定スキーマに一致）
+        返却キー: id, section_key, label, content_text, updated_at
+        """
+        try:
+            rows = self.db.execute_query("""
+                SELECT
+                    pss.id,
+                    pss.section_key,
+                    pss.label,
+                    pss.content_text,
+                    pss.updated_at
+                FROM policy_steps ps
+                JOIN project_step_sections pss ON pss.step_id = ps.id
+                WHERE ps.project_id = %s
+                  AND ps.step_key   = %s
+                ORDER BY pss.order_no
+            """, (project_id, step_key))
+            # フィールド名を SectionRepo 仕様に合わせる
+            data = []
+            for r in rows:
+                data.append({
+                    "id": r["id"],
+                    "section_key": r["section_key"],
+                    "label": r.get("label"),
+                    "content_text": r.get("content_text") or "",
+                    "updated_at": r.get("updated_at"),
+                })
+            return _dt_to_str(data)
+        except Exception as e:
+            raise CRUDError(f"ステップセクション(ラベル付き)取得エラー: {e}")
+        
+    def get_recent_chat_messages(self, session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        指定セッションの直近メッセージを最大 limit 件だけ取得。
+        返却は **古い→新しい（昇順）** に並べ替えて返すので、そのまま文脈に使えます。
+        """
+        try:
+            rows = self.db.execute_query("""
+                SELECT role, msg_type, content, created_at
+                FROM (
+                    SELECT role, msg_type, content, created_at
+                    FROM chat_messages
+                    WHERE session_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                ) t
+                ORDER BY created_at ASC
+            """, (session_id, limit))
+            return _dt_to_str(rows)
+        except Exception as e:
+            raise CRUDError(f"チャット履歴取得エラー: {e}")
+
 
 # global instance & aliases
 mysql_crud = MySQLCRUD()
@@ -244,6 +300,10 @@ def save_project_step_sections(project_id: str, step_key: str, sections: List[Di
 
 def get_project_step_sections(project_id: str, step_key: str) -> List[Dict[str, Any]]:
     return mysql_crud.get_project_step_sections(project_id, step_key)
+
+def get_recent_chat_messages(session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    return mysql_crud.get_recent_chat_messages(session_id, limit)
+
 
 def health_check() -> Dict[str, Any]:
     return mysql_crud.health_check()
