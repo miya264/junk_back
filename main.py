@@ -55,6 +55,7 @@ class UTF8JSONResponse(JSONResponse):
         kwargs.setdefault('media_type', 'application/json; charset=utf-8')
         super().__init__(content, **kwargs)
 
+
 # 環境変数
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
@@ -725,3 +726,72 @@ if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+# --- かんちゃん追加250824: フロントが受け取るユーザー型 ---
+class AppUser(BaseModel):
+    id: int
+    name: str
+    dept: Optional[str] = None
+    email: Optional[str] = None
+    imageUrl: Optional[str] = None  # ない場合はフロント側でイニシャルアバターにフォールバック
+
+# --- 追加: coworker を1件取得するヘルパー ---
+def _get_coworker_by_id(coworker_id: int) -> Optional[dict]:
+    rows = _execute_query(
+        """
+        SELECT 
+          c.id,
+          c.name,
+          c.position,
+          c.email,
+          d.name AS department_name,
+          c.image_url
+        FROM coworkers c
+        LEFT JOIN departments d ON d.id = c.department_id
+        WHERE c.id = %s
+        """,
+        (coworker_id,),
+    )
+    return rows[0] if rows else None
+
+# --- 追加: /api/me ---
+from fastapi import Request
+
+@app.get("/api/me", response_model=AppUser)
+async def get_me(request: Request):
+    """
+    現在ログイン中のユーザーを返す。
+    まだ本番の認証がない前提で、以下の順にユーザーIDを解決：
+      1) Cookie 'app_user_id'
+      2) ヘッダー 'X-User-Id'
+      3) （暫定）1 をデフォルト
+    本番では認証基盤（JWT/NextAuth等）に差し替え。
+    """
+    # 1) Cookie 優先
+    user_id = request.cookies.get("app_user_id")
+    # 2) ヘッダーがあれば上書き（ローカル検証用）
+    header_id = request.headers.get("X-User-Id")
+    if header_id:
+        user_id = header_id
+    # 3) 暫定フォールバック
+    if not user_id:
+        user_id = "1"
+
+    try:
+        user = _get_coworker_by_id(int(user_id))
+        if not user:
+            # 未ログイン扱い
+            from fastapi import HTTPException
+            raise HTTPException(status_code=401, detail="unauthorized")
+
+        return AppUser(
+            id=user["id"],
+            name=user["name"],
+            dept=user.get("department_name") or "",
+            email=user.get("email") or "",
+            imageUrl=user.get("image_url") or None,
+        )
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
