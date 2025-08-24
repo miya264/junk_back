@@ -93,6 +93,15 @@ if PINECONE_API_KEY:
 
 if not OPENAI_API_KEY or not PINECONE_API_KEY:
     print("⚠️ Warning: Some AI services not available due to missing environment variables")
+    print(f"   OPENAI_API_KEY: {'SET' if OPENAI_API_KEY else 'NOT SET'}")
+    print(f"   PINECONE_API_KEY: {'SET' if PINECONE_API_KEY else 'NOT SET'}")
+    print(f"   PINECONE_INDEX_NAME: {INDEX_NAME}")
+    print("   📋 To fix this in Azure App Service:")
+    print("   1. Go to Configuration → Application settings")
+    print("   2. Add OPENAI_API_KEY with your OpenAI API key")  
+    print("   3. Add PINECONE_API_KEY with your Pinecone API key")
+    print("   4. Add PINECONE_INDEX_NAME with your index name (default: rag-hakusho)")
+    print("   5. Restart the app service")
 
 # 政策立案エージェントシステムの初期化（AI サービスが利用可能な場合のみ）
 policy_system = None
@@ -355,6 +364,9 @@ def rerank_documents(query: str, docs: list[Document], chat: ChatOpenAI, top_k: 
 def perform_rag_search(query: str) -> tuple[str, list[dict]]:
     """RAG検索を実行し、回答テキストと出典リストを返す"""
     try:
+        if not embedding_model or not index:
+            return "申し訳ございませんが、現在RAG検索機能は利用できません。環境設定を確認してください。", []
+        
         query_embedding = embedding_model.embed_query(query)
         results = index.query(vector=query_embedding, top_k=15, include_metadata=True)
 
@@ -451,6 +463,9 @@ def perform_rag_search(query: str) -> tuple[str, list[dict]]:
 def perform_policy_step(content: str, step: str, context: dict = None) -> str:
     """政策立案ステップ別処理"""
     try:
+        if not policy_system:
+            return "申し訳ございませんが、現在政策立案機能は利用できません。環境設定を確認してください。"
+        
         result = policy_system.process_step(step, content, context)
         return result
     except Exception as e:
@@ -459,12 +474,18 @@ def perform_policy_step(content: str, step: str, context: dict = None) -> str:
 def perform_normal_chat(content: str, session_id: str = None) -> str:
     """通常のチャット（自然な対話型壁打ち相手）"""
     try:
+        if not chat:
+            return "申し訳ございませんが、現在チャット機能は利用できません。環境設定を確認してください。"
+        
         fact_context = ""
-        if session_id:
-            session_state = flexible_policy_system._get_session_state(session_id)
-            if session_state["fact_search_results"]:
-                recent_facts = "\\n\\n".join(session_state["fact_search_results"][-2:])
-                fact_context = f"\\n\\n【これまでのファクト検索結果】\\n{recent_facts}"
+        if session_id and flexible_policy_system:
+            try:
+                session_state = flexible_policy_system._get_session_state(session_id)
+                if session_state and session_state.get("fact_search_results"):
+                    recent_facts = "\\n\\n".join(session_state["fact_search_results"][-2:])
+                    fact_context = f"\\n\\n【これまでのファクト検索結果】\\n{recent_facts}"
+            except Exception as e:
+                print(f"Warning: Failed to get session state: {e}")
 
         user_input_with_context = content + fact_context if fact_context else content
         
@@ -492,10 +513,17 @@ async def chat_endpoint(request: MessageRequest):
 
         # 1. RAG検索ボタンが押された場合を最優先で処理
         if request.search_type == "fact":
-            ai_content, sources = perform_rag_search(request.content)
+            if not (embedding_model and index):
+                ai_content = "申し訳ございませんが、現在RAG検索機能は利用できません。環境設定を確認してください。"
+                sources = []
+            else:
+                ai_content, sources = perform_rag_search(request.content)
             
             if request.session_id and flexible_policy_system and hasattr(flexible_policy_system, "add_fact_search_result"):
-                flexible_policy_system.add_fact_search_result(request.session_id, ai_content)
+                try:
+                    flexible_policy_system.add_fact_search_result(request.session_id, ai_content)
+                except Exception as e:
+                    print(f"Warning: Failed to add fact search result: {e}")
 
             # RAG結果をDBに保存（検索クエリ＋出典）
             try:
@@ -524,26 +552,39 @@ async def chat_endpoint(request: MessageRequest):
 
         # 2. 政策立案ステップのボタンが押された場合
         elif request.flow_step:
-            session_id = request.session_id or str(uuid.uuid4())
-            project_id = request.project_id
-            
-            result = flexible_policy_system.process_flexible(
-                request.content,
-                session_id,
-                request.flow_step,
-                project_id
-            )
-            
-            if "error" in result:
-                ai_content = result["error"]
+            if not flexible_policy_system:
+                ai_content = "申し訳ございませんが、現在政策立案機能は利用できません。環境設定を確認してください。"
             else:
-                ai_content = result["result"]
+                session_id = request.session_id or str(uuid.uuid4())
+                project_id = request.project_id
+                
+                try:
+                    result = flexible_policy_system.process_flexible(
+                        request.content,
+                        session_id,
+                        request.flow_step,
+                        project_id
+                    )
+                except Exception as e:
+                    print(f"Error in flexible_policy_system.process_flexible: {e}")
+                    result = {"error": "政策立案処理中にエラーが発生しました。"}
+                
+                if "error" in result:
+                    ai_content = result["error"]
+                else:
+                    ai_content = result["result"]
             
         # 3. その他（人脈検索、通常のチャットなど）
         elif request.search_type == "network":
-            ai_content = perform_normal_chat(request.content)
+            if not chat:
+                ai_content = "申し訳ございませんが、現在チャット機能は利用できません。環境設定を確認してください。"
+            else:
+                ai_content = perform_normal_chat(request.content)
         else:
-            ai_content = perform_normal_chat(request.content, request.session_id)
+            if not chat:
+                ai_content = "申し訳ございませんが、現在チャット機能は利用できません。環境設定を確認してください。"
+            else:
+                ai_content = perform_normal_chat(request.content, request.session_id)
         
         ai_message = MessageResponse(
             id=str(uuid.uuid4()),
@@ -560,25 +601,6 @@ async def chat_endpoint(request: MessageRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/policy-step", response_model=PolicyStepResponse)
-async def policy_step_endpoint(request: PolicyStepRequest):
-    """政策立案ステップ別処理エンドポイント"""
-    try:
-        ai_content = perform_policy_step(request.content, request.step, request.context)
-        
-        response = PolicyStepResponse(
-            id=str(uuid.uuid4()),
-            content=ai_content,
-            step=request.step,
-            timestamp=datetime.now().isoformat(),
-            context=request.context
-        )
-        
-        return UTF8JSONResponse(response.dict())
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.post("/api/policy-flexible", response_model=FlexiblePolicyResponse)
 async def flexible_policy_endpoint(request: MessageRequest):
     """柔軟な政策立案エンドポイント"""
@@ -586,15 +608,22 @@ async def flexible_policy_endpoint(request: MessageRequest):
         if not request.flow_step:
             raise HTTPException(status_code=400, detail="flow_step is required")
         
+        if not flexible_policy_system:
+            raise HTTPException(status_code=503, detail="Policy system not available. Please check environment configuration.")
+        
         session_id = request.session_id or str(uuid.uuid4())
         project_id = request.project_id
         
-        result = flexible_policy_system.process_flexible(
-            request.content,
-            session_id,
-            request.flow_step,
-            project_id
-        )
+        try:
+            result = flexible_policy_system.process_flexible(
+                request.content,
+                session_id,
+                request.flow_step,
+                project_id
+            )
+        except Exception as e:
+            print(f"Error in flexible_policy_system.process_flexible: {e}")
+            raise HTTPException(status_code=500, detail="政策立案処理中にエラーが発生しました。")
         
         if "error" in result:
             raise HTTPException(status_code=400, detail=result["error"])
