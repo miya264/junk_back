@@ -42,8 +42,10 @@ class MySQLConnection:
             "charset": "utf8mb4",
             "collation": "utf8mb4_unicode_ci",
             "autocommit": True,
-            "pool_name": "mypool",
-            "pool_size": 5,
+            "use_unicode": True,
+            "connect_timeout": 5,  # タイムアウトを短縮
+            "buffered": True,
+            "sql_mode": "",  # パフォーマンス最適化
             **ssl_args,
         }
 

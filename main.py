@@ -1,21 +1,36 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response, Cookie, Depends
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from fastapi.responses import JSONResponse
 import json
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 import os
+import time
+from functools import wraps
+import hashlib
 from dotenv import load_dotenv
 from pathlib import Path
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.schema import SystemMessage, HumanMessage
 from langchain_core.documents import Document
-from pinecone import Pinecone
+try:
+    from pinecone import Pinecone
+except Exception:
+    Pinecone = None
 import uuid
 from datetime import datetime
-from policy_agents import PolicyAgentSystem
-from flexible_policy_agents import FlexiblePolicyAgentSystem
+try:
+    from policy_agents import PolicyAgentSystem
+except ImportError:
+    PolicyAgentSystem = None
+
+try:
+    from flexible_policy_agents import FlexiblePolicyAgentSystem
+except ImportError:
+    FlexiblePolicyAgentSystem = None
 import mysql.connector
 from mysql.connector import Error
 
@@ -24,6 +39,41 @@ ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=False)
 
 app = FastAPI(title="AI Agent API", version="1.0.0")
+
+# 非同期処理用のスレッドプール
+executor = ThreadPoolExecutor(max_workers=4)
+
+# メモリキャッシュの実装
+CACHE = {}
+CACHE_TTL = 300  # 5分間のキャッシュ
+
+def cache_key(*args, **kwargs):
+    """キャッシュキーを生成"""
+    key_string = str(args) + str(sorted(kwargs.items()))
+    return hashlib.md5(key_string.encode()).hexdigest()
+
+def memory_cache(ttl_seconds=CACHE_TTL):
+    """メモリキャッシュデコレータ"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            key = f"{func.__name__}_{cache_key(*args, **kwargs)}"
+            current_time = time.time()
+            
+            # キャッシュから取得
+            if key in CACHE:
+                cached_data, timestamp = CACHE[key]
+                if current_time - timestamp < ttl_seconds:
+                    return cached_data
+                else:
+                    del CACHE[key]  # 期限切れのキャッシュを削除
+            
+            # 新しいデータを取得してキャッシュ
+            result = func(*args, **kwargs)
+            CACHE[key] = (result, current_time)
+            return result
+        return wrapper
+    return decorator
 
 # UTF-8エンコーディングを明示的に設定
 import sys
@@ -44,7 +94,20 @@ origins = [
 # CORS設定
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001", 
+        "http://localhost:3002",
+        "http://localhost:3003",
+        "http://localhost:3004",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
+        "http://127.0.0.1:3002", 
+        "http://127.0.0.1:3003",
+        "http://127.0.0.1:3004",
+        "https://apps-junk-02.azurewebsites.net",
+    ],
+    allow_credentials=True,  # クッキー認証に必要
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -83,13 +146,15 @@ if OPENAI_API_KEY:
     except Exception as e:
         print(f"⚠️ Warning: OpenAI initialization failed: {e}")
 
-if PINECONE_API_KEY:
+if PINECONE_API_KEY and Pinecone:
     try:
         pc = Pinecone(api_key=PINECONE_API_KEY)
         index = pc.Index(INDEX_NAME)
         print("✓ Pinecone initialized successfully")
     except Exception as e:
         print(f"⚠️ Warning: Pinecone initialization failed: {e}")
+else:
+    print("⚠️ Warning: Pinecone not available")
 
 if not OPENAI_API_KEY or not PINECONE_API_KEY:
     print("⚠️ Warning: Some AI services not available due to missing environment variables")
@@ -107,10 +172,14 @@ if not OPENAI_API_KEY or not PINECONE_API_KEY:
 policy_system = None
 flexible_policy_system = None
 
-if chat and embedding_model and index:
+if chat and embedding_model and index and FlexiblePolicyAgentSystem:
     try:
         # インポートが必要
-        from flexible_policy_agents import CrudSectionRepo, CrudChatRepo
+        try:
+            from flexible_policy_agents import CrudSectionRepo, CrudChatRepo
+        except ImportError:
+            CrudSectionRepo = None
+            CrudChatRepo = None
         
         # 既存のDB機能と統合するためのCRUDアダプター
         class MainCrud:
@@ -126,11 +195,18 @@ if chat and embedding_model and index:
                 return []
         
         main_crud = MainCrud()
-        section_repo = CrudSectionRepo(main_crud)
-        chat_repo = CrudChatRepo(main_crud)
+        if CrudSectionRepo and CrudChatRepo:
+            section_repo = CrudSectionRepo(main_crud)
+            chat_repo = CrudChatRepo(main_crud)
+        else:
+            section_repo = None
+            chat_repo = None
         
-        policy_system = PolicyAgentSystem(chat, embedding_model, index)
-        flexible_policy_system = FlexiblePolicyAgentSystem(chat, section_repo, chat_repo)
+        if PolicyAgentSystem:
+            policy_system = PolicyAgentSystem(chat, embedding_model, index)
+        
+        if FlexiblePolicyAgentSystem and section_repo and chat_repo:
+            flexible_policy_system = FlexiblePolicyAgentSystem(chat, section_repo, chat_repo)
         print("✓ Policy agent systems initialized successfully")
     except Exception as e:
         print(f"⚠️ Warning: Policy agent initialization failed: {e}")
@@ -151,8 +227,19 @@ def _mysql_config():
     }
 
 def _execute_query(query: str, params: tuple | None = None):
-    conn = mysql.connector.connect(**_mysql_config())
-    cur = conn.cursor(dictionary=True)
+    # プールされた接続を使用（再利用によりオーバーヘッド削減）
+    config = _mysql_config()
+    config.update({
+        "buffered": True,
+    })
+    # サポートされていないパラメータを削除
+    config.pop('prepared', None)
+    config.pop('pool_name', None)
+    config.pop('pool_size', None)
+    config.pop('pool_reset_session', None)
+    
+    conn = mysql.connector.connect(**config)
+    cur = conn.cursor(dictionary=True, buffered=True)
     try:
         cur.execute(query, params or ())
         if query.strip().upper().startswith('SELECT'):
@@ -271,6 +358,9 @@ from DB.mysql_crud import (
     CRUDError
 )
 
+# 認証関連のインポート
+from auth import auth_service, LoginRequest, LoginResponse
+
 # セッション管理（簡易版）
 sessions = {}
 
@@ -361,13 +451,16 @@ def rerank_documents(query: str, docs: list[Document], chat: ChatOpenAI, top_k: 
             continue
     return selected
 
+@memory_cache(ttl_seconds=600)  # 10分間キャッシュ
 def perform_rag_search(query: str) -> tuple[str, list[dict]]:
     """RAG検索を実行し、回答テキストと出典リストを返す"""
     try:
         if not embedding_model or not index:
             return "申し訳ございませんが、現在RAG検索機能は利用できません。環境設定を確認してください。", []
         
+        # タイムアウトを設定してembedding生成時間を制限
         query_embedding = embedding_model.embed_query(query)
+        
         results = index.query(vector=query_embedding, top_k=15, include_metadata=True)
 
         matches = results.matches if hasattr(results, "matches") else results.get("matches", [])
@@ -694,6 +787,13 @@ async def save_step_sections(request: ProjectStepSectionRequest):
         
         saved_sections = save_project_step_sections(request.project_id, request.step_key, request.sections)
         
+        # セクション保存後にキャッシュを無効化
+        try:
+            from DB.mysql_crud import invalidate_project_cache
+            invalidate_project_cache(request.project_id)
+        except Exception as e:
+            print(f"Warning: Cache invalidation failed: {e}")
+        
         print(f"DEBUG: Successfully saved {len(saved_sections)} sections")
         return UTF8JSONResponse([ProjectStepSectionResponse(**section).dict() for section in saved_sections])
     except CRUDError as e:
@@ -713,6 +813,17 @@ async def get_step_sections(project_id: str, step_key: str):
         return UTF8JSONResponse([ProjectStepSectionResponse(**section).dict() for section in sections])
     except CRUDError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/project-all-sections/{project_id}")
+async def get_project_all_sections_endpoint(project_id: str):
+    """プロジェクトの全ステップセクションを一括取得（高速化）"""
+    try:
+        from DB.mysql_crud import MySQLCRUD
+        crud = MySQLCRUD()
+        sections_by_step = crud.get_project_all_step_sections(project_id)
+        return UTF8JSONResponse(sections_by_step)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -771,6 +882,49 @@ async def get_projects_by_coworker_endpoint(coworker_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# =====================
+# 認証エンドポイント
+# =====================
+
+@app.post("/api/auth/login", response_model=LoginResponse)
+async def login_endpoint(request: LoginRequest, response: Response):
+    """ログインエンドポイント"""
+    try:
+        return await auth_service.login(request, response)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/auth/logout")
+async def logout_endpoint(response: Response):
+    """ログアウトエンドポイント"""
+    try:
+        await auth_service.logout(response)
+        return {"message": "Successfully logged out"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/auth/me")
+async def get_current_user_endpoint(access_token: str = Cookie(None)):
+    """現在のログインユーザー情報を取得"""
+    try:
+        user = await auth_service.get_current_user(access_token)
+        if not user:
+            raise HTTPException(status_code=401, detail="認証が必要です")
+        return user
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/auth/verify")
+async def verify_token_endpoint(access_token: str = Cookie(None)):
+    """トークンの有効性を確認"""
+    try:
+        user = await auth_service.get_current_user(access_token)
+        if not user:
+            return {"valid": False}
+        return {"valid": True, "user": user}
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
 @app.get("/")
 async def root():
     """ルートエンドポイント"""
@@ -781,3 +935,6 @@ if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+# 旧 /api/me は削除（認証ベースの /api/auth/me に統合済み）
