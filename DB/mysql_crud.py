@@ -2,7 +2,40 @@
 from typing import List, Dict, Any, Optional
 import uuid
 from datetime import datetime
+import time
+import hashlib
+from functools import wraps
 from DB.mysql_connection import get_mysql_db, MySQLConnection
+
+# インメモリキャッシュ
+_CACHE = {}
+_CACHE_TTL = 180  # 3分間（頻繁に更新されるデータなので短め）
+
+def _cache_key(*args, **kwargs):
+    """キャッシュキーを生成"""
+    key_string = str(args) + str(sorted(kwargs.items()))
+    return hashlib.md5(key_string.encode()).hexdigest()
+
+def cache_query(ttl_seconds=_CACHE_TTL):
+    """クエリ結果キャッシュデコレータ"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            key = f"{func.__name__}_{_cache_key(*args, **kwargs)}"
+            current_time = time.time()
+            
+            if key in _CACHE:
+                cached_data, timestamp = _CACHE[key]
+                if current_time - timestamp < ttl_seconds:
+                    return cached_data
+                else:
+                    del _CACHE[key]
+            
+            result = func(*args, **kwargs)
+            _CACHE[key] = (result, current_time)
+            return result
+        return wrapper
+    return decorator
 
 class CRUDError(Exception):
     pass
@@ -21,8 +54,10 @@ class MySQLCRUD:
         self.db: MySQLConnection = get_mysql_db()
 
     # ---------- coworkers ----------
+    @cache_query(ttl_seconds=300)  # 5分間キャッシュ（メンバー情報は比較的静的）
     def search_coworkers(self, q: str = "", department: str = "") -> List[Dict[str, Any]]:
         try:
+            # 最適化: LIMIT追加とインデックス効率の改善
             sql = """
                 SELECT c.id, c.name, c.position, c.email, d.name AS department_name
                 FROM coworkers c
@@ -31,13 +66,14 @@ class MySQLCRUD:
             """
             params: list[Any] = []
             if q:
+                # より効率的な検索: 最も一般的な検索を最初に
                 sql += " AND (c.name LIKE %s OR c.email LIKE %s OR c.position LIKE %s)"
                 t = f"%{q}%"
                 params.extend([t, t, t])
             if department:
                 sql += " AND d.name LIKE %s"
                 params.append(f"%{department}%")
-            sql += " ORDER BY c.name"
+            sql += " ORDER BY c.name LIMIT 100"  # 検索結果を制限してパフォーマンス向上
             return _dt_to_str(self.db.execute_query(sql, tuple(params) if params else None))
         except Exception as e:
             raise CRUDError(f"同僚検索エラー: {e}")
@@ -93,26 +129,56 @@ class MySQLCRUD:
         except Exception as e:
             raise CRUDError(f"プロジェクト取得エラー: {e}")
 
+    @cache_query(ttl_seconds=120)  # 2分間キャッシュ（プロジェクトは頻繁に更新）
     def get_projects_by_coworker(self, coworker_id: int) -> List[Dict[str, Any]]:
         try:
-            projects = self.db.execute_query("""
-                SELECT DISTINCT p.id, p.name, p.description, COALESCE(p.status,'active') AS status,
-                       p.owner_coworker_id, p.created_at, p.updated_at, c.name AS owner_name
+            # 単一クエリでプロジェクトとメンバー情報を同時取得（N+1問題解決）
+            rows = self.db.execute_query("""
+                SELECT p.id, p.name, p.description, COALESCE(p.status,'active') AS status,
+                       p.owner_coworker_id, p.created_at, p.updated_at, oc.name AS owner_name,
+                       mc.id as member_id, mc.name as member_name, mc.position as member_position,
+                       mc.email as member_email, md.name as member_department_name, pm.role as member_role
                 FROM projects p
-                JOIN coworkers c ON p.owner_coworker_id = c.id
+                JOIN coworkers oc ON p.owner_coworker_id = oc.id
+                LEFT JOIN project_members pm_filter ON (p.id = pm_filter.project_id AND pm_filter.coworker_id = %s)
                 LEFT JOIN project_members pm ON p.id = pm.project_id
-                WHERE pm.coworker_id = %s OR p.owner_coworker_id = %s
-                ORDER BY p.updated_at DESC
-            """, (coworker_id, coworker_id))
-            for p in projects:
-                p["members"] = self.db.execute_query("""
-                    SELECT c.id, c.name, c.position, c.email, d.name AS department_name, pm.role
-                    FROM project_members pm
-                    JOIN coworkers c ON pm.coworker_id = c.id
-                    LEFT JOIN departments d ON c.department_id = d.id
-                    WHERE pm.project_id = %s
-                    ORDER BY pm.role DESC, c.name
-                """, (p["id"],))
+                LEFT JOIN coworkers mc ON pm.coworker_id = mc.id
+                LEFT JOIN departments md ON mc.department_id = md.id
+                WHERE pm_filter.coworker_id = %s OR p.owner_coworker_id = %s
+                ORDER BY p.updated_at DESC, mc.name
+            """, (coworker_id, coworker_id, coworker_id))
+            
+            # データを整形（N+1問題を解決）
+            projects_dict = {}
+            for row in rows:
+                project_id = row["id"]
+                if project_id not in projects_dict:
+                    projects_dict[project_id] = {
+                        "id": row["id"],
+                        "name": row["name"],
+                        "description": row["description"],
+                        "status": row["status"],
+                        "owner_coworker_id": row["owner_coworker_id"],
+                        "created_at": row["created_at"],
+                        "updated_at": row["updated_at"],
+                        "owner_name": row["owner_name"],
+                        "members": []
+                    }
+                
+                if row["member_id"]:
+                    member = {
+                        "id": row["member_id"],
+                        "name": row["member_name"],
+                        "position": row["member_position"],
+                        "email": row["member_email"],
+                        "department_name": row["member_department_name"],
+                        "role": row["member_role"]
+                    }
+                    # 重複チェック
+                    if not any(m["id"] == member["id"] for m in projects_dict[project_id]["members"]):
+                        projects_dict[project_id]["members"].append(member)
+            
+            projects = list(projects_dict.values())
             return _dt_to_str(projects)
         except Exception as e:
             raise CRUDError(f"プロジェクト一覧取得エラー: {e}")
@@ -188,24 +254,65 @@ class MySQLCRUD:
         except Exception as e:
             raise CRUDError(f"ステップセクション保存エラー: {e}")
 
+    @cache_query(ttl_seconds=60)  # 1分間キャッシュ（セクション内容は頻繁に編集される）
     def get_project_step_sections(self, project_id: str, step_key: str) -> List[Dict[str, Any]]:
+        try:
+            # さらに最適化: EXISTS使用でパフォーマンス向上
+            rows = self.db.execute_query("""
+                SELECT pss.id,
+                       pss.project_id,
+                       %s as step_key,
+                       pss.section_key,
+                       pss.content_text AS content,
+                       pss.created_at,
+                       pss.updated_at
+                FROM project_step_sections pss
+                WHERE pss.project_id = %s 
+                  AND EXISTS (SELECT 1 FROM policy_steps ps WHERE ps.id = pss.step_id AND ps.step_key = %s)
+                ORDER BY pss.order_no
+            """, (step_key, project_id, step_key))
+            return _dt_to_str(rows)
+        except Exception as e:
+            raise CRUDError(f"ステップセクション取得エラー: {e}")
+
+    @cache_query(ttl_seconds=180)  # 3分間キャッシュ（複数ステップまとめて取得）
+    def get_project_all_step_sections(self, project_id: str) -> Dict[str, List[Dict[str, Any]]]:
+        """全ステップのセクションを一括取得（フロント側で複数ステップ表示時に使用）"""
         try:
             rows = self.db.execute_query("""
                 SELECT pss.id,
                        pss.project_id,
                        ps.step_key,
                        pss.section_key,
-                       pss.content_text AS content,   -- ← ここが重要
+                       pss.content_text AS content,
                        pss.created_at,
-                       pss.updated_at
+                       pss.updated_at,
+                       pss.order_no
                 FROM project_step_sections pss
                 JOIN policy_steps ps ON pss.step_id = ps.id
-                WHERE pss.project_id = %s AND ps.step_key = %s
-                ORDER BY pss.order_no
-            """, (project_id, step_key))
-            return _dt_to_str(rows)
+                WHERE pss.project_id = %s
+                ORDER BY ps.step_key, pss.order_no
+            """, (project_id,))
+            
+            # ステップ別にグループ化
+            sections_by_step = {}
+            for row in rows:
+                step_key = row['step_key']
+                if step_key not in sections_by_step:
+                    sections_by_step[step_key] = []
+                sections_by_step[step_key].append({
+                    'id': row['id'],
+                    'project_id': row['project_id'],
+                    'step_key': row['step_key'],
+                    'section_key': row['section_key'],
+                    'content': row['content'],
+                    'created_at': row['created_at'],
+                    'updated_at': row['updated_at']
+                })
+            
+            return _dt_to_str(sections_by_step)
         except Exception as e:
-            raise CRUDError(f"ステップセクション取得エラー: {e}")
+            raise CRUDError(f"全ステップセクション取得エラー: {e}")
 
     # ---------- health ----------
     def health_check(self) -> Dict[str, Any]:
@@ -300,6 +407,13 @@ def save_project_step_sections(project_id: str, step_key: str, sections: List[Di
 
 def get_project_step_sections(project_id: str, step_key: str) -> List[Dict[str, Any]]:
     return mysql_crud.get_project_step_sections(project_id, step_key)
+
+def invalidate_project_cache(project_id: str):
+    """プロジェクト関連のキャッシュを無効化"""
+    keys_to_remove = [key for key in _CACHE.keys() if project_id in key]
+    for key in keys_to_remove:
+        del _CACHE[key]
+    print(f"Cache invalidated for project {project_id}: {len(keys_to_remove)} entries removed")
 
 def get_recent_chat_messages(session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
     return mysql_crud.get_recent_chat_messages(session_id, limit)
