@@ -649,11 +649,11 @@ class FlexiblePolicyAgentSystem:
             # ステップの“ゴール達成”に直結するミニ整理＋ファクト提案
             body = (
                 f"【{STEP_CONFIG[current_step]['title']}の要点】\n"
-                f"見えていること\n{_two_bullets(parsed['known'])}\n\n"
-                f"足りないこと\n{_two_bullets(parsed['gaps'])}\n\n"
-                f"必要なファクト\n{_two_bullets(parsed['facts'])}\n\n"
-                f"収集方法の提案\n{_two_bullets(parsed['how'])}\n\n"
-                f"次の一歩\n{_two_bullets(parsed['next'])}\n\n"
+                f"●見えていること\n{_two_bullets(parsed['known'])}\n\n"
+                f"●足りないこと\n{_two_bullets(parsed['gaps'])}\n\n"
+                f"●必要なファクト\n{_two_bullets(parsed['facts'])}\n\n"
+                f"●収集方法の提案\n{_two_bullets(parsed['how'])}\n\n"
+                f"●次の一歩\n{_two_bullets(parsed['next'])}\n\n"
                 f"確認ですが、{parsed.get('q','この方向でよいですか？')}"
             )
             tail += "\n\n" + body
@@ -775,13 +775,7 @@ class FlexiblePolicyAgentSystem:
                     if f"次は「{title}」" in last_assistant:
                         return key
 
-
         return None
-
-
-
-
-
 
     # 互換エイリアス
     def process(self, *a, **kw): return self.process_flexible(*a, **kw)
@@ -800,3 +794,6 @@ class FlexiblePolicyAgentSystem:
             "step_timestamps": st["step_timestamps"],
             "step_completion": st["step_completion"],
         }
+
+
+		

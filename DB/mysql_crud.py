@@ -1,11 +1,18 @@
 # DB/mysql_crud.py  ← このファイルを丸ごと置き換え
 from typing import List, Dict, Any, Optional
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import time
 import hashlib
 from functools import wraps
 from DB.mysql_connection import get_mysql_db, MySQLConnection
+
+# 日本時間（JST）のタイムゾーン設定
+JST = timezone(timedelta(hours=9))
+
+def get_jst_now():
+    """現在の日本時間を取得"""
+    return datetime.now(JST)
 
 # インメモリキャッシュ
 _CACHE = {}
@@ -240,7 +247,7 @@ class MySQLCRUD:
                     sec.get("content", "")
                 ))
 
-                now = datetime.now().isoformat()
+                now = get_jst_now().isoformat()
                 saved.append({
                     "id": section_id,
                     "project_id": project_id,

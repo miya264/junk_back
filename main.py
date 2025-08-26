@@ -24,7 +24,7 @@ try:
 except Exception:
     Pinecone = None
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 try:
     from policy_agents import PolicyAgentSystem
 except ImportError:
@@ -85,6 +85,13 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
+
+# 日本時間（JST）のタイムゾーン設定
+JST = timezone(timedelta(hours=9))
+
+def get_jst_now():
+    """現在の日本時間を取得"""
+    return datetime.now(JST)
 
 origins = [
     # ローカル開発環境のオリジン
@@ -520,14 +527,26 @@ def perform_rag_search(query: str) -> tuple[str, list[dict]]:
             documents_string += f"{source_info}\n{doc.page_content.strip()}\n\n"
 
         prompt = PromptTemplate(
-            template="""あなたは思考整理をサポートする壁打ち相手です。ユーザーからの質問と、それに関連する複数の参照資料が提供されます。
+            template="""
+あなたは思考整理をサポートする壁打ち相手です。ユーザーからの質問と、それに関連する複数の参照資料が提供されます。
 これらの資料を活用して、ユーザーへの応答を作成してください。
 
 【基本ルール】
-- 参照資料内の情報を要約して、自然な文章で回答してください。
-- **必ず**本文中の該当する箇所に**提供された形式の出典情報（例：【〇〇白書 - 第3章】）を付与**してください。
-- 参照資料に記載されていない推測や一般的な知識は含めないでください。
-- 回答は、ユーザーの考えを引き出すような問いかけで締めくくってください。
+1. 出典に基づく情報は、自然な文章で要約し、必ず本文中に【資料名 – 章節】の形式で出典を明記する。
+2. 出典に存在しない情報は「この資料からは確認できません」と明言する。
+3. 情報が一部しか見つからない場合は、「情報不足」として整理する。
+4. 情報不足がある場合は、次のような具体的な探し方を提示する：
+   - **専門家に聞く**：商工会議所の経営相談窓口、中小企業診断士協会、中小機構の「よろず支援拠点」に常駐するDXアドバイザー
+   - **論文を読む**：CiNiiで「中小企業 DX 成功事例」、Google Scholarで「SME digital transformation Japan」などで検索
+   - **統計を見る**：総務省「通信利用動向調査」、経産省「中小企業白書」、IPA「DX白書」
+   - **実務者に聞く**：LinkedInで「DX推進担当」と肩書のある人、業界団体の交流会、自治体のDXセミナー
+5. 最後に、ユーザーの考えを引き出すような問いかけで締めくくる。
+
+【出力フォーマット】
+●情報整理（参照資料に基づく要約）
+●情報不足（確認できなかった内容）
+●代替的な探し方（具体的に）
+●投げかけ（ユーザーに次の一歩を考えさせる質問）
 
 【参照資料】
 {documents}
@@ -539,6 +558,7 @@ def perform_rag_search(query: str) -> tuple[str, list[dict]]:
 """,
             input_variables=["documents", "query"]
         )
+
 
         messages = [
             SystemMessage(content="あなたは思考整理をサポートする壁打ち相手です。回答の本文中に参照資料の情報を直接引用し、事実に基づいた応答を生成してください。"),
@@ -747,7 +767,7 @@ async def chat_endpoint(request: MessageRequest):
                 id=str(uuid.uuid4()),
                 content=json.dumps(ai_content, ensure_ascii=False),
                 type="ai",
-                timestamp=datetime.now().isoformat(),
+                timestamp=get_jst_now().isoformat(),
                 search_type=request.search_type
             )
         else:
@@ -755,7 +775,7 @@ async def chat_endpoint(request: MessageRequest):
                 id=str(uuid.uuid4()),
                 content=ai_content,
                 type="ai",
-                timestamp=datetime.now().isoformat(),
+                timestamp=get_jst_now().isoformat(),
                 search_type=request.search_type
             )
         # DB保存: AIメッセージ（辞書型の場合はJSON文字列として保存）
@@ -798,7 +818,7 @@ async def flexible_policy_endpoint(request: MessageRequest):
             id=str(uuid.uuid4()),
             content=result["result"],
             step=result["step"],
-            timestamp=datetime.now().isoformat(),
+            timestamp=get_jst_now().isoformat(),
             session_id=session_id,
             project_id=project_id,
             navigate_to=result.get("navigate_to"),  # ステップ移動情報
@@ -839,7 +859,7 @@ async def get_sessions():
 async def create_session():
     """新しいセッションを作成"""
     session_id = str(uuid.uuid4())
-    now = datetime.now()
+    now = get_jst_now()
     
     session = ChatSession(
         id=session_id,
