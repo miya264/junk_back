@@ -16,6 +16,9 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.schema import SystemMessage, HumanMessage
 from langchain_core.documents import Document
+import urllib.parse
+from routers.routers_people import router as people_router
+
 try:
     from pinecone import Pinecone
 except Exception:
@@ -33,6 +36,7 @@ except ImportError:
     FlexiblePolicyAgentSystem = None
 import mysql.connector
 from mysql.connector import Error
+import requests
 
 # 環境変数の読み込み（backend/.env を明示的に参照）
 ENV_PATH = Path(__file__).resolve().parent / ".env"
@@ -127,6 +131,8 @@ class UTF8JSONResponse(JSONResponse):
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "rag-hakusho")
+GBIZINFO_API_KEY = os.getenv("GBIZINFO_API_KEY")
+GBIZINFO_URL = os.getenv("GBIZINFO_URL", "https://info.gbiz.go.jp/hojin/v1/hojin")
 
 # モデルの初期化（環境変数が設定されている場合のみ）
 embedding_model = None
@@ -604,10 +610,20 @@ def perform_normal_chat(content: str, session_id: str = None) -> str:
 async def chat_endpoint(request: MessageRequest):
     """チャットエンドポイント"""
     try:
+        # デバッグログを追加
+        print(f"[DEBUG] Received request: content='{request.content}', search_type='{request.search_type}'")
         # DB保存: ユーザーメッセージ
         sid = request.session_id or str(uuid.uuid4())
         session_id, step_id = _ensure_chat_session(sid, request.project_id, request.flow_step)
         _save_chat_message(session_id, request.project_id, step_id, 'user', request.search_type or 'normal', request.content)
+
+        # デバッグ: 条件分岐の詳細を確認
+        print(f"[DEBUG] Checking conditions:")
+        print(f"[DEBUG] request.search_type: '{request.search_type}' (type: {type(request.search_type)})")
+        print(f"[DEBUG] request.flow_step: '{request.flow_step}' (type: {type(request.flow_step)})")
+        print(f"[DEBUG] search_type == 'fact': {request.search_type == 'fact'}")
+        print(f"[DEBUG] search_type == 'network': {request.search_type == 'network'}")
+        print(f"[DEBUG] flow_step is truthy: {bool(request.flow_step)}")
 
         # 1. RAG検索ボタンが押された場合を最優先で処理
         if request.search_type == "fact":
@@ -648,7 +664,52 @@ async def chat_endpoint(request: MessageRequest):
             except Exception as e:
                 print(f"WARN: failed to save rag_search_results: {e}")
 
-        # 2. 政策立案ステップのボタンが押された場合
+        # 2. 人脈検索ボタンが押された場合（search_typeを優先）
+        elif request.search_type == "network":
+            print(f"[DEBUG] Network search triggered for: '{request.content}'")
+            # 人脈検索の実装
+            try:
+                # 既存の人脈検索APIを内部的に呼び出し
+                req = PeopleSearchRequest(query=request.content, top_k=5, coworker_id=None)
+                safe_sql, raw_sql = _generate_and_sanitize_people_sql(
+                    req.query.strip(), req.top_k, req.coworker_id
+                )
+                rows = _execute_query_db2(safe_sql, None)
+                
+                if rows:
+                    candidates = []
+                    for r in rows:
+                        candidates.append({
+                            "id": r.get('id'),
+                            "name": r.get('name'),
+                            "company": r.get('company'),
+                            "title": r.get('title') or r.get('position', ''),
+                            "department": r.get('department'),
+                            "score": r.get('score', 0)
+                        })
+                    
+                    # 構造化データとして返す
+                    ai_content = {
+                        "type": "people_search_result",
+                        "query": request.content,
+                        "candidates": candidates[:5],
+                        "narrative": f"「{request.content}」に関連する人物を{len(candidates[:5])}名見つけました。"
+                    }
+                else:
+                    ai_content = {
+                        "type": "people_search_result", 
+                        "query": request.content,
+                        "candidates": [],
+                        "narrative": f"「{request.content}」に関連する人物が見つかりませんでした。別のキーワードで検索してみてください。"
+                    }
+                    
+            except Exception as e:
+                print(f"People search failed: {e}")
+                ai_content = f"人脈検索中にエラーが発生しました。通常のチャットで対応します。\n\n質問: {request.content}"
+                if chat:
+                    ai_content = perform_normal_chat(request.content)
+
+        # 3. 政策立案ステップのボタンが押された場合
         elif request.flow_step:
             if not flexible_policy_system:
                 ai_content = "申し訳ございませんが、現在政策立案機能は利用できません。環境設定を確認してください。"
@@ -672,27 +733,34 @@ async def chat_endpoint(request: MessageRequest):
                 else:
                     ai_content = result["result"]
             
-        # 3. その他（人脈検索、通常のチャットなど）
-        elif request.search_type == "network":
-            if not chat:
-                ai_content = "申し訳ございませんが、現在チャット機能は利用できません。環境設定を確認してください。"
-            else:
-                ai_content = perform_normal_chat(request.content)
+        # 4. 通常のチャット
         else:
+            print(f"[DEBUG] Normal chat triggered for: '{request.content}', search_type='{request.search_type}'")
             if not chat:
                 ai_content = "申し訳ございませんが、現在チャット機能は利用できません。環境設定を確認してください。"
             else:
                 ai_content = perform_normal_chat(request.content, request.session_id)
         
-        ai_message = MessageResponse(
-            id=str(uuid.uuid4()),
-            content=ai_content,
-            type="ai",
-            timestamp=datetime.now().isoformat(),
-            search_type=request.search_type
-        )
-        # DB保存: AIメッセージ
-        _save_chat_message(session_id, request.project_id, step_id, 'ai', request.search_type or 'normal', ai_content)
+        # ai_contentが辞書型（人脈検索結果）の場合はJSONとして処理
+        if isinstance(ai_content, dict):
+            ai_message = MessageResponse(
+                id=str(uuid.uuid4()),
+                content=json.dumps(ai_content, ensure_ascii=False),
+                type="ai",
+                timestamp=datetime.now().isoformat(),
+                search_type=request.search_type
+            )
+        else:
+            ai_message = MessageResponse(
+                id=str(uuid.uuid4()),
+                content=ai_content,
+                type="ai",
+                timestamp=datetime.now().isoformat(),
+                search_type=request.search_type
+            )
+        # DB保存: AIメッセージ（辞書型の場合はJSON文字列として保存）
+        db_content = json.dumps(ai_content, ensure_ascii=False) if isinstance(ai_content, dict) else ai_content
+        _save_chat_message(session_id, request.project_id, step_id, 'ai', request.search_type or 'normal', db_content)
         
         return UTF8JSONResponse(ai_message.dict())
         
@@ -943,3 +1011,823 @@ if __name__ == "__main__":
 
 
 # 旧 /api/me は削除（認証ベースの /api/auth/me に統合済み）
+# =====================
+# People Search (LLM→SQL with JOINs) ここから
+# =====================
+from pydantic import Field  # 再import可
+import re as _re
+import json as _json  # 使わなくてもOK（デバッグ用）
+
+# LLM に使わせてよいテーブルとカラムを明示（これ以外は不可）
+ALLOWED_TABLES = {
+    "business_cards": [
+        "id", "name", "company", "department", "position", "memo",
+        "owner_coworker_id", "corporate_number", "company_id"
+    ],
+    "companies": [
+        "id", "name", "corporate_number", "postal_code", "location",
+        "company_type", "founding_date", "capital", "employee_number",
+        "business_summary", "update_date"
+    ],
+    "coworker_relations": [
+        "coworker_id", "business_card_id", "first_contact_date",
+        "last_contact_date", "contact_count"
+    ],
+}
+
+# 役に立たない汎用語（WHEREに入ると0件になりやすい語を拡充）
+GENERIC_TOKENS: set[str] = {
+    "社員", "担当者", "従業員", "役職", "職種", "部門", "部署",
+    "会社", "企業", "日本", "国内", "海外", "本社",
+    # 業種・業界系（bc.department に誤って入れがち）
+    "業種", "業界", "小売", "小売業", "サービス業", "メーカー", "製造業", "IT業界"
+}
+
+def _cleanup_nl_query(q: str) -> str:
+    """
+    自然文のキーワードを正規化:
+    - / ・、・,・空白で分割（全角空白も半角に）
+    - 汎用語/業種語を除去
+    - 重複排除（順序は維持）
+    例: '任天堂/ゲーム/日本/役職/部門/社員' -> '任天堂 ゲーム'
+    """
+    q = (q or "").replace("　", " ")  # 全角空白→半角
+    q = q.replace("／", "/").replace("、", "/").replace(",", "/")
+    parts = [p.strip() for p in re.split(r"[\/\s]+", q) if p.strip()]
+    parts = [p for p in parts if p not in GENERIC_TOKENS]
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            cleaned.append(p)
+    return " ".join(cleaned) if cleaned else (q.strip() or "")
+
+
+
+# --- DB2 (junk_db) 向けの接続ヘルパ（人物検索専用） ---
+def _mysql_config_db2():
+    return {
+        'host': os.getenv('DB_HOST2'),
+        'port': int(os.getenv('DB_PORT2', 3306)),
+        'user': os.getenv('DB_USER2'),
+        'password': os.getenv('DB_PASSWORD2'),
+        'database': os.getenv('DB_NAME2'),
+        'ssl_ca': os.getenv('DB_SSL_CA_PATH2'),
+        'charset': 'utf8mb4',
+        'autocommit': True,
+    }
+
+def _execute_query_db2(query: str, params: tuple | None = None):
+    cfg = _mysql_config_db2()
+    connect_kwargs = dict(
+        host=cfg['host'],
+        port=cfg['port'],
+        user=cfg['user'],
+        password=cfg['password'],
+        database=cfg['database'],
+        charset=cfg.get('charset', 'utf8mb4'),
+        autocommit=cfg.get('autocommit', True),
+        use_pure=True,
+    )
+    if cfg.get('ssl_ca'):
+        connect_kwargs['ssl_ca'] = cfg['ssl_ca']
+    conn = mysql.connector.connect(**connect_kwargs)
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(query, params or ())
+        if query.strip().upper().startswith('SELECT'):
+            return cur.fetchall()
+        conn.commit()
+        return []
+    finally:
+        try:
+            cur.close()
+        finally:
+            conn.close()
+
+# --- ネットワーク図データを作る（中心=名刺、外周=名刺保有者） -----------------
+def _get_network_for_card(card_id: int) -> dict:
+    # 中心（名刺）
+    sql_center = """
+        SELECT bc.id, bc.name, COALESCE(bc.company, c.name) AS company
+        FROM business_cards bc
+        LEFT JOIN companies c ON c.id = bc.company_id
+        WHERE bc.id = %s
+    """
+    rows = _execute_query_db2(sql_center, (card_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="business_card not found")
+    center = rows[0]
+    center_id = f"card:{center['id']}"
+    nodes = [{"id": center_id, "label": f"{center['name']}", "kind": "中心"}]
+    edges = []
+
+    # 名刺を保有している社内メンバー
+    sql_holders = """
+        SELECT cw.id AS coworker_id, cw.name AS coworker_name, d.name AS dept,
+               cr.first_contact_date, cr.last_contact_date, cr.contact_count
+        FROM coworker_relations cr
+        JOIN coworkers cw       ON cw.id = cr.coworker_id
+        LEFT JOIN departments d ON d.id = cw.department_id
+        WHERE cr.business_card_id = %s
+        ORDER BY COALESCE(cr.last_contact_date, cr.first_contact_date) DESC, cw.name
+    """
+    holders = _execute_query_db2(sql_holders, (card_id,))
+    for h in holders:
+        nid = f"cw:{h['coworker_id']}"
+        label = f"{h['coworker_name']}" + (f"\n{h['dept']}" if h.get("dept") else "")
+        nodes.append({"id": nid, "label": label, "kind": "名刺保有者"})
+        edges.append({"source": center_id, "target": nid, "label": "名刺保有者"})
+
+    return {"nodes": nodes, "edges": edges}
+
+
+# デバッグ出力（生成SQLを返す）
+PEOPLE_SQL_DEBUG  = os.getenv("PEOPLE_SQL_DEBUG", "0") == "1"
+
+class PeopleSearchRequest(BaseModel):
+    query: str = Field(..., description="自然文の検索条件（例：'富山 EC デザイン'）")
+    top_k: int = Field(5, ge=1, le=50, description="最大件数")
+    coworker_id: int | None = Field(None, description="優先したい同僚のID（任意）")
+
+def _people_generate_sql_with_llm(
+    nl_query: str,
+    top_k: int,
+    coworker_id: int | None,
+    force_single_select: bool = False,
+    force_template: bool = False,
+) -> str:
+    """
+    日本語→MySQL SELECT を1文だけ生成。必要に応じて JOIN。
+    force_single_select: 「SELECT は1回だけ」と強く制約
+    force_template: SELECT … FROM business_cards bc … LIMIT n の形を強制
+    """
+    if not chat:
+        raise HTTPException(status_code=500, detail="OpenAI (chat) が初期化されていません")
+
+    # スキーマをプロンプトへ
+    schema_desc = []
+    for tbl, cols in ALLOWED_TABLES.items():
+        schema_desc.append(f"- {tbl}({', '.join(cols)})")
+    schema_text = "\n".join(schema_desc)
+
+    rules = [
+        # ← 明確に「SELECT は1回だけ」を宣言（単語レベル）
+        "Generate EXACTLY ONE SELECT statement only. The word SELECT must appear EXACTLY ONCE.",
+        # ← サブクエリ全面禁止を “(SELECT …)” まで名指しで明示
+        "NO subqueries of any kind: NO EXISTS(...), NO IN (SELECT ...), NO (SELECT ...) in any expression, NO CTEs, NO UNION.",
+        "The main table MUST be business_cards (alias bc).",
+        "Use LEFT JOIN companies c ON c.id = bc.company_id when needed.",
+        "Use LEFT JOIN coworker_relations cr ON cr.business_card_id = bc.id when needed.",
+        "Use only allowed columns. Return these aliases: id, name, company, department, title, avatar_url, score",
+        "company := COALESCE(c.name, bc.company), title := COALESCE(bc.title, bc.position)",
+        "ALWAYS ORDER BY score DESC, id ASC.",
+        "ALWAYS include LIMIT (the number will be overwritten later).",
+        'Output MUST be a single JSON object: {"sql": "..."} . No extra text, no code fences.',
+        # 文字列比較は常に部分一致で
+        "All text filters MUST use LIKE with wildcards: LIKE CONCAT('%', <keyword>, '%'). "
+        "Never use equality (=) for company names or titles.",
+        # 会社名のゆらぎ対策（“株式会社”“(株)”や空白を無視）
+        "When matching company names, normalize by stripping '株式会社', '(株)', and spaces using "
+        "REPLACE(REPLACE(REPLACE(COALESCE(c.name, bc.company),'株式会社',''),'(株)',''),' ',''). "
+        "Compare that normalized value with LIKE CONCAT('%', <company_keyword>, '%').",
+            # ★ ここを新規追加：業種語は無視する指示
+        "Industry/sector words (e.g., 小売業, 製造業, IT業界) MUST NOT be mapped to bc.department; "
+        "bc.department is an internal team like 営業部/開発部. If the user mentions an industry, ignore that condition."
+    ]
+    if force_single_select:
+        rules.insert(0, "The word SELECT must appear EXACTLY ONCE in the whole statement.")
+    if force_template:
+        rules.insert(0, "Your SQL MUST match this shape strictly: "
+                        "SELECT <columns> FROM business_cards bc"
+                        "[ LEFT JOIN <table> <alias> ON <cond> ]*"
+                        "[ WHERE <conditions> ]* ORDER BY <expr> LIMIT <n>")
+
+    system = (
+        "You are a strict SQL generator for MySQL 8.\n"
+        f"Allowed tables and columns:\n{schema_text}\n\n"
+        "Rules:\n- " + "\n- ".join(rules) + "\n"
+    )
+
+    hints = []
+    if coworker_id is not None:
+        hints.append(
+            f"Prefer or filter by coworker_relations.coworker_id = {coworker_id} "
+            "(e.g., add COALESCE(cr.contact_count,0) to score)."
+        )
+    hints_text = ("\nHints:\n- " + "\n- ".join(hints)) if hints else ""
+
+    example = (
+        "{\n"
+        "  \"sql\": \"SELECT bc.id AS id, bc.name AS name,\n"
+        "                  COALESCE(c.name, bc.company) AS company,\n"
+        "                  bc.department AS department,\n"
+        "                  COALESCE(bc.title, bc.position) AS title,\n"
+        "                  bc.avatar_url AS avatar_url,\n"
+        "                  (COALESCE(cr.contact_count,0)) AS score\n"
+        "           FROM business_cards bc\n"
+        "           LEFT JOIN companies c ON c.id = bc.company_id\n"
+        "           LEFT JOIN coworker_relations cr ON cr.business_card_id = bc.id\n"
+        "           ORDER BY score DESC, id ASC LIMIT 5\"\n"
+        "}"
+    )
+
+    user = (
+        "User intent (Japanese natural language):\n"
+        f"{nl_query}\n\n"
+        f"{hints_text}\n"
+        "Write the query WITHOUT any subqueries; if you think you need EXISTS/IN, "
+        "always rewrite it using LEFT JOIN + WHERE or JOIN-based scoring.\n"
+        "Return JSON only, for example:\n" + example
+    )
+
+    resp = chat.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+    content_text = str(resp.content).strip()
+
+    m = _re.search(r"\{[\s\S]*\}", content_text)
+    if not m:
+        raise HTTPException(status_code=500, detail=f"LLM出力の解析に失敗しました: {content_text[:200]}")
+    try:
+        data = json.loads(m.group(0))
+        sql = (data.get("sql") or "").strip()
+        if not sql:
+            raise ValueError("empty sql")
+        return sql
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM JSON 解析に失敗: {e}")
+
+_ALLOWED_TABLE_NAMES = set(ALLOWED_TABLES.keys())
+
+def _people_sanitize_sql(sql: str, top_k: int) -> str:
+    """
+    - 先に存在しない列を安全な列へ書き換え
+    - その後、DML/DDL/UNION/CTE/サブクエリ禁止 などを検査
+    - LIMIT を強制
+    """
+    s = sql.strip().rstrip(";")
+
+    # ★★★ ここを追加：存在しない列を強制リライト（大文字小文字を無視）
+    s = _re.sub(r"\bbc\.title\b", "bc.position", s, flags=_re.I)
+    s = _re.sub(r"\bbc\.avatar_url\b", "NULL",        s, flags=_re.I)
+
+    # 以降は今のサニタイズのまま（Only single SELECT, (select…)/exists/in(select) 禁止 など）
+    low_raw = s.lower()
+    banned_regexes = [
+        r";", r"\binsert\b", r"\bupdate\b", r"\bdelete\b",
+        r"\bdrop\b", r"\balter\b", r"\bcreate\b", r"\bgrant\b", r"\brevoke\b", r"\btruncate\b",
+        r"\bunion\b", r"\bwith\b",
+        r"\bin\s*\(\s*select\b", r"\bexists\s*\(", r"\(\s*select\b",
+    ]
+    for pat in banned_regexes:
+        if _re.search(pat, low_raw):
+            raise HTTPException(status_code=400, detail="Unsafe SQL is not allowed")
+
+    low = _re.sub(r"\s+", " ", low_raw)
+
+    num_selects = len(_re.findall(r"\bselect\b", low_raw, flags=_re.I))
+    if num_selects != 1:
+        raise HTTPException(status_code=400, detail="Only a single SELECT is allowed")
+
+    if " from business_cards" not in low:
+        raise HTTPException(status_code=400, detail="Root table must be business_cards")
+
+    tables = _re.findall(r"\b(from|join)\s+([a-zA-Z0-9_]+)", low)
+    used_tables = {t[1] for t in tables}
+    if not used_tables.issubset(_ALLOWED_TABLE_NAMES):
+        bad = sorted(list(used_tables - _ALLOWED_TABLE_NAMES))
+        raise HTTPException(status_code=400, detail=f"Disallowed tables detected: {bad}")
+
+    if _re.search(r"\blimit\b\s+\d+", s, flags=_re.I):
+        s = _re.sub(r"\blimit\b\s+\d+", f"LIMIT {int(top_k)}", s, flags=_re.I)
+    else:
+        s = s + f" LIMIT {int(top_k)}"
+
+    return s
+
+
+# ★ ここにリトライ用ヘルパを追加
+def _generate_and_sanitize_people_sql(nl_query: str, top_k: int, coworker_id: int | None):
+    """
+    1回目: 通常生成 → サニタイズ
+    2回目: 「SELECTは1回だけ」を強制して再生成 → サニタイズ
+    3回目: さらにテンプレート強制で再生成 → サニタイズ
+    いずれか成功した段階で返す。すべて失敗なら最後のエラーを送出。
+    """
+    attempts = [
+        dict(force_single_select=False, force_template=False),
+        dict(force_single_select=True,  force_template=False),
+        dict(force_single_select=True,  force_template=True),
+    ]
+
+    last_err = None
+    for i, opt in enumerate(attempts, 1):
+        try:
+            raw_sql = _people_generate_sql_with_llm(
+                nl_query, top_k, coworker_id,
+                force_single_select=opt["force_single_select"],
+                force_template=opt["force_template"],
+            )
+            safe_sql = _people_sanitize_sql(raw_sql, top_k)
+            if PEOPLE_SQL_DEBUG:
+                print(f"[people-sql attempt {i}] OK\nRAW={raw_sql}\nSAFE={safe_sql}")
+            return safe_sql, raw_sql
+        except HTTPException as e:
+            last_err = e
+            # デバッグ用に生SQLも出す（サニタイズ前に落ちるケースはraw_sqlが無いので無視）
+            try:
+                print(f"[people-sql attempt {i}] FAIL: {e.detail}  (raw maybe above)")
+            except Exception:
+                pass
+            continue
+
+    # 3回とも弾かれた
+    if last_err:
+        raise last_err
+    raise HTTPException(status_code=400, detail="SQL generation failed")
+
+@app.post("/api/people/search")
+async def people_search_endpoint(req: PeopleSearchRequest):
+    if not (req.query or "").strip():
+        return UTF8JSONResponse({"candidates": []})
+
+    eff_coworker_id = req.coworker_id if (req.coworker_id and req.coworker_id > 0) else None
+
+    safe_sql, raw_sql = _generate_and_sanitize_people_sql(
+        req.query.strip(), req.top_k, eff_coworker_id
+    )
+
+    # 実行（DB2: junk_db）
+    try:
+        rows = _execute_query_db2(safe_sql, None)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    candidates = []
+    for r in rows:
+        candidates.append({
+            "id": r.get("id"),
+            "name": r.get("name"),
+            "company": r.get("company") or "",
+            "department": r.get("department"),
+            "title": r.get("title"),
+            "skills": None,
+            "avatar_url": r.get("avatar_url"),
+            "score": r.get("score") if r.get("score") is not None else 0,
+        })
+
+    # 0件なら coworkers 検索にフォールバック
+    if not candidates:
+        try:
+            results = search_coworkers(q=req.query, department="")
+            candidates = [{
+                "id":         r["id"],
+                "name":       r["name"],
+                "company":    "",
+                "department": r.get("department_name"),
+                "title":      r.get("position"),
+                "skills":     None,
+                "avatar_url": None,
+                "score":      0,
+            } for r in (results[:req.top_k] if isinstance(results, list) else [])]
+        except Exception as ex:
+            raise HTTPException(status_code=500, detail=f"coworkers 検索のフォールバックに失敗しました: {ex}") from ex
+
+    res = {"candidates": candidates}
+    if PEOPLE_SQL_DEBUG:
+        res["debug_sql"] = {"raw": raw_sql, "sanitized": safe_sql}
+    return UTF8JSONResponse(res)
+
+# =====================
+# People Search (LLM→SQL with JOINs) ここまで
+# =====================
+
+# =====================
+# (追加) LLMファーストの人物探索 /api/people/ask
+# =====================
+from pydantic import BaseModel
+
+class PeopleAskRequest(BaseModel):
+    """自然文の質問から、LLMが検索クエリを立てて人物候補を返す"""
+    question: str
+    top_k: int = 5
+    coworker_id: int | None = None  # 任意: 自分(や同僚)IDを優先度のヒントに使う
+
+class PeopleAskResponse(BaseModel):
+    narrative: str                     # LLMが返す前置きテキスト（「こういう人に当たりましょう」など）
+    queries: list[str]                 # LLMが組み立てた自然文クエリ（/api/people/search にそのまま渡せる）
+    candidates: list[dict]             # 人物カード（id, name, company, department, title, score など）
+    # debug: dict | None = None       # 必要ならデバッグも返せます
+
+def _people_search_core(nl_query: str, top_k: int, coworker_id: int | None) -> tuple[list[dict], dict]:
+    """
+    既存の人物検索ロジックを関数化（/api/people/search と同等）。
+    返り値: (candidates, debug_sql)
+    """
+    eff_coworker_id = coworker_id if (coworker_id and coworker_id > 0) else None
+    safe_sql, raw_sql = _generate_and_sanitize_people_sql(nl_query.strip(), top_k, eff_coworker_id)
+
+    try:
+        rows = _execute_query_db2(safe_sql, None)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    candidates: list[dict] = []
+    for r in rows:
+        candidates.append({
+            "id": r.get("id"),
+            "name": r.get("name"),
+            "company": r.get("company") or "",
+            "department": r.get("department"),
+            "title": r.get("title"),
+            "skills": None,
+            "avatar_url": r.get("avatar_url"),
+            "score": r.get("score") if r.get("score") is not None else 0,
+        })
+
+    # 0件なら coworkers テーブルにフォールバック（既存と同じ）
+    if not candidates:
+        try:
+            results = search_coworkers(q=nl_query, department="")
+            candidates = [{
+                "id":         r["id"],
+                "name":       r["name"],
+                "company":    "",
+                "department": r.get("department_name"),
+                "title":      r.get("position"),
+                "skills":     None,
+                "avatar_url": None,
+                "score":      0,
+            } for r in (results[:top_k] if isinstance(results, list) else [])]
+        except Exception as ex:
+            raise HTTPException(status_code=500, detail=f"coworkers 検索のフォールバックに失敗しました: {ex}") from ex
+
+    debug_sql = {"raw": raw_sql, "sanitized": safe_sql}
+    return candidates, debug_sql
+
+def _people_plan_queries(question: str, coworker_id: int | None) -> tuple[str, list[str]]:
+    """
+    LLMに「質問→最大3つの検索クエリ」と「短い前置き文」をJSONで作らせる。
+    返り値: (narrative, queries)
+    """
+    if not chat:
+        raise HTTPException(status_code=500, detail="OpenAI (chat) が初期化されていません")
+
+    hints = []
+    if coworker_id is not None and coworker_id > 0:
+        hints.append(f"手元の名刺を持っている同僚IDが {coworker_id} なら、その同僚が関わっていそうな候補を優先して良い。")
+
+    system = (
+        "あなたは名刺DBから適切な人物を探すための検索プランナーです。"
+        "ユーザーの自然文の質問を読み取り、名刺DBに投げる日本語の検索クエリを最大3個、簡潔に作ってください。"
+        "各クエリは『会社名/部署/役割/地域/キーワード』などを含む短文で構いません。"
+        "また、最初に短い前置き（どのジャンル・立場の人に当たるべきか）も作ってください。"
+        "出力は必ず JSON 一個のみで、以下のスキーマに正確に従ってください："
+        '{"narrative":"...","queries":["...","..."]}'
+    )
+    user = (
+        f"ユーザーの質問: {question}\n"
+        + (f"ヒント: {', '.join(hints)}\n" if hints else "")
+        + "必ず JSON だけを返してください。余計な文章・コードフェンスは不要です。"
+    )
+
+    resp = chat.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+    text = str(resp.content).strip()
+
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        # JSONが取れない時は質問そのものを1クエリにする（前処理付き）
+        return "以下の観点で該当しそうな人物を探索します。", [_cleanup_nl_query(question)]
+
+    try:
+        data = json.loads(m.group(0))
+        narrative = (data.get("narrative") or "").strip() or "以下の観点で該当しそうな人物を探索します。"
+
+        # ① JSONから取り出し
+        queries = [q for q in (data.get("queries") or []) if isinstance(q, str) and q.strip()]
+        if not queries:
+            queries = [question]
+
+        # ② クレンジング
+        queries = [_cleanup_nl_query(q) for q in queries]
+        queries = [q for q in queries if q] or [_cleanup_nl_query(question)]
+
+        return narrative, queries[:3]
+    except Exception:
+        # 壊れたJSONでも安全に
+        return "以下の観点で該当しそうな人物を探索します。", [_cleanup_nl_query(question)]
+
+@app.post("/api/people/ask", response_model=PeopleAskResponse)
+async def people_ask_endpoint(req: PeopleAskRequest):
+    """
+    例）{ "question": "富山県で行ったこのプロジェクトに詳しそうな人は？", "top_k": 5 }
+    レスポンス：前置き文 + LLMが立てたクエリ配列 + 名刺DBの候補
+    """
+    if not (req.question or "").strip():
+        return UTF8JSONResponse(PeopleAskResponse(narrative="質問が空です。", queries=[], candidates=[]).dict())
+
+    # 1) LLMでクエリ計画
+    narrative, queries = _people_plan_queries(req.question.strip(), req.coworker_id)
+
+    # 2) 各クエリを人物検索にかけて集約
+    all_candidates: dict[int, dict] = {}
+    per_query_limit = max(1, req.top_k)  # 各クエリで十分拾う
+    for q in queries:
+        try:
+            cand, _dbg = _people_search_core(q, per_query_limit, req.coworker_id)
+        except HTTPException as e:
+            # 1クエリ失敗しても他を続行
+            print(f"[people/ask] query failed: {q} -> {e.detail}")
+            continue
+        for c in cand:
+            cid = c.get("id")
+            if cid is None:
+                continue
+            ex = all_candidates.get(cid)
+            if ex is None or (c.get("score", 0) > (ex.get("score", 0) or 0)):
+                all_candidates[cid] = c
+
+    # 3) スコア順に並べ替えて上位を返す
+    merged = sorted(all_candidates.values(), key=lambda x: (x.get("score") or 0, x.get("id") or 0), reverse=True)
+    merged = merged[: req.top_k]
+
+    return UTF8JSONResponse(PeopleAskResponse(narrative=narrative, queries=queries, candidates=merged).dict())
+
+# ===== 会社情報 API =====
+from pydantic import BaseModel
+
+class CompanyInfo(BaseModel):
+    id: int | None = None
+    name: str
+    corporate_number: str | None = None
+    location: str | None = None
+    company_type: str | None = None
+    founding_date: str | None = None
+    capital: str | None = None
+    employee_number: int | None = None
+    business_summary: str | None = None
+
+class CompanyInfoResponse(BaseModel):
+    company: CompanyInfo | None
+
+@app.get("/api/companies/by-name", response_model=CompanyInfoResponse)
+async def api_company_by_name(name: str):
+    """
+    会社名で 1 件だけ取得。まずは完全一致、無ければ緩めの一致で拾う。
+    参照DBは junk_db の companies。
+    """
+    try:
+        sql1 = """
+            SELECT id, name, corporate_number, location, company_type,
+                   founding_date, capital, employee_number, business_summary
+            FROM companies
+            WHERE name = %s
+            LIMIT 1
+        """
+        rows = _execute_query_db2(sql1, (name,))
+        if not rows:
+            # ()/（）/株式会社 の揺れを吸収したゆるめ検索
+            sql2 = """
+                SELECT id, name, corporate_number, location, company_type,
+                       founding_date, capital, employee_number, business_summary
+                FROM companies
+                WHERE REPLACE(REPLACE(REPLACE(name,'株式会社',''),'（','('),'）',')')
+                      LIKE CONCAT('%', REPLACE(REPLACE(REPLACE(%s,'株式会社',''),'（','('),'）',')'), '%')
+                ORDER BY id ASC
+                LIMIT 1
+            """
+            rows = _execute_query_db2(sql2, (name,))
+
+        if not rows:
+            return {"company": None}
+
+        r = rows[0]
+        return {
+            "company": {
+                "id": r.get("id"),
+                "name": r.get("name"),
+                "corporate_number": r.get("corporate_number"),
+                "location": r.get("location"),
+                "company_type": r.get("company_type"),
+                "founding_date": r.get("founding_date"),
+                "capital": r.get("capital"),
+                "employee_number": r.get("employee_number"),
+                "business_summary": r.get("business_summary"),
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- gBizINFO helpers: ここから追加（/detail の直前に置く） -----------------
+def _fetch_gbiz_by_number(corporate_number: str):
+    base = (GBIZINFO_URL or "").rstrip("/") or "https://info.gbiz.go.jp/hojin/v1/hojin"
+    url = f"{base}/{corporate_number}"
+    resp = requests.get(
+        url,
+        headers={"X-hojinInfo-api-token": GBIZINFO_API_KEY or "", "accept": "application/json"},
+        timeout=10,
+    )
+    print("[gBizINFO:number]", resp.status_code, url)
+    try:
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, None
+
+def _fetch_gbiz_by_name(company_name: str):
+    # ざっくり正規化（ゆらぎ吸収）
+    norm = str(company_name or "").replace("　", " ")
+    for t in ("株式会社", "（株）", "(株)"):
+        norm = norm.replace(t, "")
+    norm = norm.strip()
+
+    base = (GBIZINFO_URL or "").rstrip("/") or "https://info.gbiz.go.jp/hojin/v1/hojin"
+    from urllib.parse import urlencode
+    url = f"{base}?{urlencode({'name': norm})}"
+    resp = requests.get(
+        url,
+        headers={"X-hojinInfo-api-token": GBIZINFO_API_KEY or "", "accept": "application/json"},
+        timeout=10,
+    )
+    print("[gBizINFO:name]", resp.status_code, url)
+    try:
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, None
+
+def _extract_gbiz_info(payload):
+    if not payload:
+        return None
+    arr = payload.get("hojin-infos") or payload.get("hojinInfos") or []
+    if not arr:
+        return None
+    info = arr[0]
+    return {
+        "corporate_number": info.get("corporate_number"),
+        "name": info.get("name"),
+        "location": info.get("location"),
+        "postal_code": info.get("postal_code"),
+        "company_type": info.get("qualification_grade"),
+        "founding_date": info.get("date_of_establishment"),
+        "capital": info.get("capital_stock"),
+        "employee_number": info.get("employee_number"),
+        "business_summary": info.get("business_summary"),
+        "update_date": info.get("update_date"),
+    }
+# --- gBizINFO helpers: ここまで追加 -----------------------------------------
+
+@app.get("/detail/{card_id}")
+def get_detail(card_id: int):
+    # --- 名刺情報（MySQL: junk_db） ---
+    sql_card = """
+        SELECT bc.id, bc.name, bc.company, bc.department, bc.position, bc.memo,
+               bc.company_id, c.corporate_number
+        FROM business_cards bc
+        LEFT JOIN companies c ON bc.company_id = c.id
+        WHERE bc.id = %s
+    """
+    rows = _execute_query_db2(sql_card, (card_id,))
+    if not rows:
+        raise HTTPException(404, "card not found")
+    card = rows[0]
+
+    # --- 同僚（同じ会社の他カード） ---
+    sql_coworkers = """
+        SELECT bc.id, bc.name, bc.department, bc.position
+        FROM business_cards bc
+        WHERE bc.company_id = %s AND bc.id <> %s
+        ORDER BY bc.id
+    """
+    coworkers = _execute_query_db2(sql_coworkers, (card["company_id"], card_id))
+
+    # --- gBizINFO: ①法人番号 → ②社名フォールバック ---
+    gbiz_info = None
+    gbiz_debug = {}
+    try:
+        corp = str(card.get("corporate_number") or "").strip()
+        if not GBIZINFO_API_KEY:
+            gbiz_debug["reason"] = "GBIZINFO_API_KEY not set"
+        else:
+            if corp:
+                sc, payload = _fetch_gbiz_by_number(corp)
+                gbiz_debug["number_status"] = sc
+                gbiz_info = _extract_gbiz_info(payload)
+
+            if not gbiz_info and (card.get("company") or "").strip():
+                name = str(card["company"]).strip()
+                sc2, payload2 = _fetch_gbiz_by_name(name)
+                gbiz_debug["name_status"] = sc2
+                gbiz_debug["queried_name"] = name
+                gbiz_info = _extract_gbiz_info(payload2)
+    except Exception as e:
+        print(f"[gBizINFO] error: {e}")
+        gbiz_debug["error"] = str(e)
+
+    return {
+        "person": card,
+        "coworkers": coworkers,
+        "gbiz_info": gbiz_info,
+        "gbiz_debug": gbiz_debug,   # ← デバッグ用ヒント（UIでは非表示でもOK）
+        "network": _get_network_for_card(card_id),
+    }
+
+@app.get("/gbizinfo/detail/{card_id}")
+def get_gbizinfo_detail(card_id: int):
+    """
+    gBizINFO の取得状況だけを検証するための専用EP。
+    見つからなければ 404 を返す（原因切り分け用）。
+    """
+    sql = """
+        SELECT bc.company, c.corporate_number
+        FROM business_cards bc
+        LEFT JOIN companies c ON bc.company_id = c.id
+        WHERE bc.id = %s
+    """
+    rows = _execute_query_db2(sql, (card_id,))
+    if not rows:
+        raise HTTPException(404, "card not found")
+
+    corp = str(rows[0].get("corporate_number") or "").strip()
+    name = str(rows[0].get("company") or "").strip()
+
+    if not GBIZINFO_API_KEY:
+        raise HTTPException(500, "GBIZINFO_API_KEY not set")
+
+    # ① 法人番号
+    if corp:
+        sc, payload = _fetch_gbiz_by_number(corp)
+        info = _extract_gbiz_info(payload)
+        if info:
+            return {"gbiz_info": info, "via": "number", "status": sc}
+
+    # ② 社名
+    if name:
+        sc2, payload2 = _fetch_gbiz_by_name(name)
+        info2 = _extract_gbiz_info(payload2)
+        if info2:
+            return {"gbiz_info": info2, "via": "name", "status": sc2, "queried_name": name}
+
+    raise HTTPException(404, "gBizINFO not found for this corporate number")
+
+@app.get("/api/coworkers/{coworker_id}/profile")
+def get_coworker_profile(coworker_id: int):
+    # --- 基本情報（title列→無ければposition列にフォールバック） ---
+    sql_basic_title = """
+        SELECT cw.id, cw.name, cw.title AS title, d.name AS department
+        FROM coworkers cw
+        LEFT JOIN departments d ON d.id = cw.department_id
+        WHERE cw.id = %s
+    """
+    sql_basic_position = """
+        SELECT cw.id, cw.name, cw.position AS title, d.name AS department
+        FROM coworkers cw
+        LEFT JOIN departments d ON d.id = cw.department_id
+        WHERE cw.id = %s
+    """
+
+    try:
+        rows = _execute_query_db2(sql_basic_title, (coworker_id,))
+    except mysql.connector.errors.ProgrammingError as e:
+        # 1054: Unknown column 'cw.title' の場合は position で再実行
+        if "1054" in str(e):
+            rows = _execute_query_db2(sql_basic_position, (coworker_id,))
+        else:
+            raise
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="coworker not found")
+
+    basic = rows[0]
+
+    # --- 経歴 ---
+    work_history = []
+    for r in _execute_query_db2("""
+        SELECT start_year, end_year, company, role, notes
+        FROM coworker_experiences
+        WHERE coworker_id = %s
+        ORDER BY COALESCE(start_year, 0), COALESCE(end_year, 9999)
+    """, (coworker_id,)):
+        sy = r.get("start_year"); ey = r.get("end_year")
+        period = f"{sy or ''}–{ey or ''}".strip("–")
+        text = " / ".join([x for x in [r.get("company"), r.get("role"), r.get("notes")] if x])
+        work_history.append({"period": period, "text": text})
+
+    # --- プロジェクト履歴 ---
+    project_history = []
+    for r in _execute_query_db2("""
+        SELECT year, title, description
+        FROM coworker_projects
+        WHERE coworker_id = %s
+        ORDER BY COALESCE(year, 0)
+    """, (coworker_id,)):
+        period = str(r.get("year") or "")
+        text = " / ".join([x for x in [r.get("title"), r.get("description")] if x])
+        project_history.append({"period": period, "text": text})
+
+    return {
+        "id": basic["id"],
+        "name": basic["name"],
+        "title": basic.get("title"),
+        "department": basic.get("department"),
+        "work_history": work_history,
+        "project_history": project_history,
+    }
