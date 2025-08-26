@@ -7,8 +7,15 @@ CRUD操作
 
 from typing import List, Dict, Optional, Any
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from db_connection import get_db
+
+# 日本時間（JST）のタイムゾーン設定
+JST = timezone(timedelta(hours=9))
+
+def get_jst_now():
+    """現在の日本時間を取得"""
+    return datetime.now(JST)
 
 
 class CRUDError(Exception):
@@ -333,8 +340,8 @@ def save_project_step_sections(project_id: str, step_key: str, sections: List[Di
                     'step_key': step_key,
                     'section_key': section.get('section_key', f'section_{i+1}'),
                     'content': section.get('content', ''),
-                    'created_at': datetime.now().isoformat(),
-                    'updated_at': datetime.now().isoformat()
+                    'created_at': get_jst_now().isoformat(),
+                    'updated_at': get_jst_now().isoformat()
                 })
             
             return saved_sections
@@ -389,7 +396,7 @@ def health_check() -> Dict[str, Any]:
         return {
             "status": "healthy",
             "database": "connected",
-            "timestamp": datetime.now().isoformat()
+            "timestamp": get_jst_now().isoformat()
         }
         
     except Exception as e:
@@ -397,5 +404,5 @@ def health_check() -> Dict[str, Any]:
             "status": "unhealthy",
             "database": "connection_failed",
             "error": str(e),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": get_jst_now().isoformat()
         }
