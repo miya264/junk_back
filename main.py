@@ -369,6 +369,7 @@ from DB.mysql_crud import (
     search_coworkers,
     create_project,
     get_project_by_id,
+    search_all_projects,
     get_projects_by_coworker,
     save_project_step_sections,
     get_project_step_sections,
@@ -959,6 +960,17 @@ async def get_project_endpoint(project_id: str):
             raise HTTPException(status_code=404, detail="Project not found")
         
         return UTF8JSONResponse(ProjectResponse(**project).dict())
+    except CRUDError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/projects", response_model=List[ProjectResponse])
+async def search_projects_endpoint(q: str = "", limit: int = 50):
+    """プロジェクト検索（全プロジェクト対象・権限制限なし）"""
+    try:
+        projects = search_all_projects(q, limit)
+        return UTF8JSONResponse([ProjectResponse(**project).dict() for project in projects])
     except CRUDError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:

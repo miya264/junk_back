@@ -137,6 +137,64 @@ class MySQLCRUD:
             raise CRUDError(f"プロジェクト取得エラー: {e}")
 
     @cache_query(ttl_seconds=120)  # 2分間キャッシュ（プロジェクトは頻繁に更新）
+    def search_all_projects(self, query: str = "", limit: int = 50) -> List[Dict[str, Any]]:
+        """全プロジェクト検索（管理者向け・権限制限なし）"""
+        try:
+            # クエリが空の場合は全件、指定がある場合は名前・説明で部分一致検索
+            if query.strip():
+                where_clause = "WHERE p.name LIKE %s OR p.description LIKE %s"
+                params = (f"%{query}%", f"%{query}%", limit)
+            else:
+                where_clause = ""
+                params = (limit,)
+            
+            rows = self.db.execute_query(f"""
+                SELECT p.id, p.name, p.description, COALESCE(p.status,'active') AS status,
+                       p.owner_coworker_id, p.created_at, p.updated_at, oc.name AS owner_name,
+                       mc.id as member_id, mc.name as member_name, mc.position as member_position,
+                       mc.email as member_email, md.name as member_department_name, pm.role as member_role
+                FROM projects p
+                JOIN coworkers oc ON p.owner_coworker_id = oc.id
+                LEFT JOIN project_members pm ON p.id = pm.project_id
+                LEFT JOIN coworkers mc ON pm.coworker_id = mc.id
+                LEFT JOIN departments md ON mc.department_id = md.id
+                {where_clause}
+                ORDER BY p.updated_at DESC, mc.name
+                LIMIT %s
+            """, params)
+            
+            # データを整形（get_projects_by_coworkerと同じロジック）
+            projects_dict = {}
+            for row in rows:
+                project_id = row['id']
+                if project_id not in projects_dict:
+                    projects_dict[project_id] = {
+                        'id': project_id,
+                        'name': row['name'],
+                        'description': row['description'],
+                        'status': row['status'],
+                        'owner_coworker_id': row['owner_coworker_id'],
+                        'owner_name': row['owner_name'],
+                        'created_at': row['created_at'],
+                        'updated_at': row['updated_at'],
+                        'members': []
+                    }
+                
+                # メンバー情報を追加（重複排除）
+                if row['member_id'] and not any(m['id'] == row['member_id'] for m in projects_dict[project_id]['members']):
+                    projects_dict[project_id]['members'].append({
+                        'id': row['member_id'],
+                        'name': row['member_name'],
+                        'position': row['member_position'],
+                        'email': row['member_email'],
+                        'department_name': row['member_department_name']
+                    })
+            
+            return _dt_to_str(list(projects_dict.values()))
+            
+        except Exception as e:
+            raise CRUDError(f"Search all projects failed: {str(e)}")
+
     def get_projects_by_coworker(self, coworker_id: int) -> List[Dict[str, Any]]:
         try:
             # 単一クエリでプロジェクトとメンバー情報を同時取得（N+1問題解決）
@@ -405,6 +463,9 @@ def create_project(name: str, description: str, owner_coworker_id: int, member_i
 
 def get_project_by_id(project_id: str) -> Optional[Dict[str, Any]]:
     return mysql_crud.get_project_by_id(project_id)
+
+def search_all_projects(query: str = "", limit: int = 50) -> List[Dict[str, Any]]:
+    return mysql_crud.search_all_projects(query, limit)
 
 def get_projects_by_coworker(coworker_id: int) -> List[Dict[str, Any]]:
     return mysql_crud.get_projects_by_coworker(coworker_id)
