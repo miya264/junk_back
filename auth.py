@@ -150,16 +150,6 @@ class AuthService:
         password_valid = self._verify_password(password, auth_user['password_hash'])
         
         if not password_valid:
-            # 古いハッシュ形式の場合の代替検証
-            if auth_user['password_hash'].startswith('hashed_password_'):
-                # テスト用の簡易検証（実際のプロジェクトでは使用しない）
-                if password in ['tanaka123', 'sato123', 'suzuki123']:
-                    password_valid = True
-            # データベースユーザー用のテスト認証（開発用）
-            elif password == '123':
-                password_valid = True
-            
-        if not password_valid:
             return None
             
         # 4. 最終ログイン時刻を更新

@@ -5,7 +5,6 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi.responses import JSONResponse
 import json
 from pydantic import BaseModel
-from pydantic import Field  # 再import可
 from typing import Optional, List, Dict
 import os
 import time
@@ -17,8 +16,8 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.schema import SystemMessage, HumanMessage
 from langchain_core.documents import Document
-import re as _re
-import json as _json 
+import urllib.parse
+from routers.routers_people import router as people_router
 
 try:
     from pinecone import Pinecone
@@ -37,6 +36,7 @@ except ImportError:
     FlexiblePolicyAgentSystem = None
 import mysql.connector
 from mysql.connector import Error
+import requests
 
 # 環境変数の読み込み（backend/.env を明示的に参照）
 ENV_PATH = Path(__file__).resolve().parent / ".env"
@@ -131,6 +131,8 @@ class UTF8JSONResponse(JSONResponse):
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "rag-hakusho")
+GBIZINFO_API_KEY = os.getenv("GBIZINFO_API_KEY")
+GBIZINFO_URL = os.getenv("GBIZINFO_URL", "https://info.gbiz.go.jp/hojin/v1/hojin")
 
 # モデルの初期化（環境変数が設定されている場合のみ）
 embedding_model = None
@@ -460,367 +462,6 @@ def rerank_documents(query: str, docs: list[Document], chat: ChatOpenAI, top_k: 
             continue
     return selected
 
-@app.get("/")
-async def root():
-    """ルートエンドポイント"""
-    return {"message": "AI Agent API is running"}
-
-if __name__ == "__main__":
-    import uvicorn
-    import os
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
-# =====================
-# 認証エンドポイント
-# =====================
-
-@app.post("/api/auth/login", response_model=LoginResponse)
-async def login_endpoint(request: LoginRequest, response: Response):
-    """ログインエンドポイント"""
-    try:
-        return await auth_service.login(request, response)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/auth/logout")
-async def logout_endpoint(response: Response):
-    """ログアウトエンドポイント"""
-    try:
-        await auth_service.logout(response)
-        return {"message": "Successfully logged out"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/auth/me")
-async def get_current_user_endpoint(access_token: str = Cookie(None)):
-    """現在のログインユーザー情報を取得"""
-    try:
-        user = await auth_service.get_current_user(access_token)
-        if not user:
-            raise HTTPException(status_code=401, detail="認証が必要です")
-        return user
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/auth/verify")
-async def verify_token_endpoint(access_token: str = Cookie(None)):
-    """トークンの有効性を確認"""
-    try:
-        user = await auth_service.get_current_user(access_token)
-        if not user:
-            return {"valid": False}
-        return {"valid": True, "user": user}
-    except Exception as e:
-        return {"valid": False, "error": str(e)}
-    
-# =====================
-# プロジェクトエンドポイント
-# =====================
-
-@app.post("/api/projects", response_model=ProjectResponse)
-async def create_project_endpoint(request: ProjectCreateRequest):
-    """プロジェクト作成"""
-    try:
-        project = create_project(
-            request.name, 
-            request.description or "", 
-            request.owner_coworker_id, 
-            request.member_ids
-        )
-        if not project:
-            raise HTTPException(status_code=400, detail="Failed to create project")
-        
-        return UTF8JSONResponse(ProjectResponse(**project).dict())
-    except CRUDError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-@app.get("/api/coworkers/search", response_model=List[CoworkerResponse])
-async def search_coworkers_endpoint(q: str = "", department: str = ""):
-    """coworkers検索"""
-    try:
-        coworkers = search_coworkers(q, department)
-        return UTF8JSONResponse([CoworkerResponse(**coworker).dict() for coworker in coworkers])
-    except CRUDError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-@app.get("/api/projects/{project_id}", response_model=ProjectResponse)
-async def get_project_endpoint(project_id: str):
-    """プロジェクト詳細取得"""
-    try:
-        project = get_project_by_id(project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
-        
-        return UTF8JSONResponse(ProjectResponse(**project).dict())
-    except CRUDError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/projects/by-coworker/{coworker_id}", response_model=List[ProjectResponse])
-async def get_projects_by_coworker_endpoint(coworker_id: int):
-    """coworkerが参加しているプロジェクト一覧取得"""
-    try:
-        projects = get_projects_by_coworker(coworker_id)
-        return UTF8JSONResponse([ProjectResponse(**project).dict() for project in projects])
-    except CRUDError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-# =====================
-# セッションエンドポイント
-# =====================
-
-@app.get("/api/session-state/{session_id}", response_model=SessionStateResponse)
-async def get_session_state(session_id: str):
-    """セッション状態を取得"""
-    try:
-        state = flexible_policy_system.get_session_state(session_id)
-        
-        if "error" in state:
-            raise HTTPException(status_code=404, detail=state["error"])
-        
-        return SessionStateResponse(**state)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/sessions", response_model=List[ChatSession])
-async def get_sessions():
-    """セッション一覧を取得"""
-    return list(sessions.values())
-
-@app.post("/api/sessions", response_model=ChatSession)
-async def create_session():
-    """新しいセッションを作成"""
-    session_id = str(uuid.uuid4())
-    now = datetime.now()
-    
-    session = ChatSession(
-        id=session_id,
-        title=f"新しいチャット {now.strftime('%Y-%m-%d %H:%M')}",
-        created_at=now.isoformat(),
-        updated_at=now.isoformat()
-    )
-    
-    sessions[session_id] = session
-    return session
-
-@app.post("/api/project-step-sections", response_model=List[ProjectStepSectionResponse])
-async def save_step_sections(request: ProjectStepSectionRequest):
-    """プロジェクトステップセクションを保存"""
-    try:
-        print(f"DEBUG: Received request: project_id={request.project_id}, step_key={request.step_key}, sections_count={len(request.sections)}")
-        print(f"DEBUG: Request sections: {request.sections}")
-        
-        saved_sections = save_project_step_sections(request.project_id, request.step_key, request.sections)
-        
-        # セクション保存後にキャッシュを無効化
-        try:
-            from DB.mysql_crud import invalidate_project_cache
-            invalidate_project_cache(request.project_id)
-        except Exception as e:
-            print(f"Warning: Cache invalidation failed: {e}")
-        
-        print(f"DEBUG: Successfully saved {len(saved_sections)} sections")
-        return UTF8JSONResponse([ProjectStepSectionResponse(**section).dict() for section in saved_sections])
-    except CRUDError as e:
-        print(f"DEBUG: CRUDError occurred: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        print(f"DEBUG: Exception occurred: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/project-step-sections/{project_id}/{step_key}", response_model=List[ProjectStepSectionResponse])
-async def get_step_sections(project_id: str, step_key: str):
-    """プロジェクトステップセクションを取得"""
-    try:
-        sections = get_project_step_sections(project_id, step_key)
-        return UTF8JSONResponse([ProjectStepSectionResponse(**section).dict() for section in sections])
-    except CRUDError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/project-all-sections/{project_id}")
-async def get_project_all_sections_endpoint(project_id: str):
-    """プロジェクトの全ステップセクションを一括取得（高速化）"""
-    try:
-        from DB.mysql_crud import MySQLCRUD
-        crud = MySQLCRUD()
-        sections_by_step = crud.get_project_all_step_sections(project_id)
-        return UTF8JSONResponse(sections_by_step)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-# =====================
-# チャットエンドポイント
-# =====================
-
-@app.post("/api/chat", response_model=MessageResponse)
-async def chat_endpoint(request: MessageRequest):
-    """チャットエンドポイント"""
-    try:
-        # DB保存: ユーザーメッセージ
-        sid = request.session_id or str(uuid.uuid4())
-        session_id, step_id = _ensure_chat_session(sid, request.project_id, request.flow_step)
-        _save_chat_message(session_id, request.project_id, step_id, 'user', request.search_type or 'normal', request.content)
-
-        # 1. RAG検索ボタンが押された場合を最優先で処理
-        if request.search_type == "fact":
-            if not (embedding_model and index):
-                ai_content = "申し訳ございませんが、現在RAG検索機能は利用できません。環境設定を確認してください。"
-                sources = []
-            else:
-                ai_content, sources = perform_rag_search(request.content)
-            
-            if request.session_id and flexible_policy_system and hasattr(flexible_policy_system, "add_fact_search_result"):
-                try:
-                    flexible_policy_system.add_fact_search_result(request.session_id, ai_content)
-                except Exception as e:
-                    print(f"Warning: Failed to add fact search result: {e}")
-
-            # RAG結果をDBに保存（検索クエリ＋出典）
-            try:
-                session_id, step_id = _ensure_chat_session(sid, request.project_id, request.flow_step)
-                # rag_search_results は project_id, step_id が NOT NULL のため、揃っている時のみ保存
-                if request.project_id and step_id:
-                    _execute_query(
-                        """
-                        INSERT INTO rag_search_results
-                          (id, project_id, step_id, session_id, query, result_text, result_json, sources_json, created_by, created_at)
-                        VALUES
-                          (%s, %s, %s, %s, %s, %s, NULL, %s, NULL, CURRENT_TIMESTAMP)
-                        """,
-                        (
-                            str(uuid.uuid4()),
-                            request.project_id,
-                            step_id,
-                            session_id,
-                            request.content,
-                            ai_content,
-                            json.dumps(sources, ensure_ascii=False),
-                        ),
-                    )
-            except Exception as e:
-                print(f"WARN: failed to save rag_search_results: {e}")
-
-        # 2. 政策立案ステップのボタンが押された場合
-        elif request.flow_step:
-            if not flexible_policy_system:
-                ai_content = "申し訳ございませんが、現在政策立案機能は利用できません。環境設定を確認してください。"
-            else:
-                session_id = request.session_id or str(uuid.uuid4())
-                project_id = request.project_id
-                
-                try:
-                    result = flexible_policy_system.process_flexible(
-                        request.content,
-                        session_id,
-                        request.flow_step,
-                        project_id
-                    )
-                except Exception as e:
-                    print(f"Error in flexible_policy_system.process_flexible: {e}")
-                    result = {"error": "政策立案処理中にエラーが発生しました。"}
-                
-                if "error" in result:
-                    ai_content = result["error"]
-                else:
-                    ai_content = result["result"]
-            
-        # 3. その他（人脈検索、通常のチャットなど）
-        elif request.search_type == "network":
-            if not chat:
-                ai_content = "申し訳ございませんが、現在チャット機能は利用できません。環境設定を確認してください。"
-            else:
-                ai_content = perform_normal_chat(request.content)
-        else:
-            if not chat:
-                ai_content = "申し訳ございませんが、現在チャット機能は利用できません。環境設定を確認してください。"
-            else:
-                ai_content = perform_normal_chat(request.content, request.session_id)
-        
-        ai_message = MessageResponse(
-            id=str(uuid.uuid4()),
-            content=ai_content,
-            type="ai",
-            timestamp=datetime.now().isoformat(),
-            search_type=request.search_type
-        )
-        # DB保存: AIメッセージ
-        _save_chat_message(session_id, request.project_id, step_id, 'ai', request.search_type or 'normal', ai_content)
-        
-        return UTF8JSONResponse(ai_message.dict())
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-# =====================
-# チャット（エージェント）エンドポイント
-# =====================
-
-@app.post("/api/policy-flexible", response_model=FlexiblePolicyResponse)
-async def flexible_policy_endpoint(request: MessageRequest):
-    """柔軟な政策立案エンドポイント"""
-    try:
-        if not request.flow_step:
-            raise HTTPException(status_code=400, detail="flow_step is required")
-        
-        if not flexible_policy_system:
-            raise HTTPException(status_code=503, detail="Policy system not available. Please check environment configuration.")
-        
-        session_id = request.session_id or str(uuid.uuid4())
-        project_id = request.project_id
-        
-        try:
-            result = flexible_policy_system.process_flexible(
-                request.content,
-                session_id,
-                request.flow_step,
-                project_id
-            )
-        except Exception as e:
-            print(f"Error in flexible_policy_system.process_flexible: {e}")
-            raise HTTPException(status_code=500, detail="政策立案処理中にエラーが発生しました。")
-        
-        if "error" in result:
-            raise HTTPException(status_code=400, detail=result["error"])
-        
-        response = FlexiblePolicyResponse(
-            id=str(uuid.uuid4()),
-            content=result["result"],
-            step=result["step"],
-            timestamp=datetime.now().isoformat(),
-            session_id=session_id,
-            project_id=project_id,
-            navigate_to=result.get("navigate_to"),  # ステップ移動情報
-            type=result.get("type"),                # レスポンスタイプ
-            full_state=result["full_state"]
-        )
-
-        # DB保存: セッション確保とメッセージ保存
-        session_id, step_id = _ensure_chat_session(session_id, project_id, request.flow_step)
-        _save_chat_message(session_id, project_id, step_id, 'user', 'normal', request.content)
-        _save_chat_message(session_id, project_id, step_id, 'ai', 'normal', result["result"]) 
-        
-        return UTF8JSONResponse(response.dict())
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-# =====================
-# チャット（RAG）エンドポイント
-# =====================
-
 @memory_cache(ttl_seconds=600)  # 10分間キャッシュ
 def perform_rag_search(query: str) -> tuple[str, list[dict]]:
     """RAG検索を実行し、回答テキストと出典リストを返す"""
@@ -964,11 +605,418 @@ def perform_normal_chat(content: str, session_id: str = None) -> str:
         
     except Exception as e:
         return f"チャット処理中にエラーが発生しました: {str(e)}"
+
+@app.post("/api/chat", response_model=MessageResponse)
+async def chat_endpoint(request: MessageRequest):
+    """チャットエンドポイント"""
+    try:
+        # デバッグログを追加
+        print(f"[DEBUG] Received request: content='{request.content}', search_type='{request.search_type}'")
+        # DB保存: ユーザーメッセージ
+        sid = request.session_id or str(uuid.uuid4())
+        session_id, step_id = _ensure_chat_session(sid, request.project_id, request.flow_step)
+        _save_chat_message(session_id, request.project_id, step_id, 'user', request.search_type or 'normal', request.content)
+
+        # デバッグ: 条件分岐の詳細を確認
+        print(f"[DEBUG] Checking conditions:")
+        print(f"[DEBUG] request.search_type: '{request.search_type}' (type: {type(request.search_type)})")
+        print(f"[DEBUG] request.flow_step: '{request.flow_step}' (type: {type(request.flow_step)})")
+        print(f"[DEBUG] search_type == 'fact': {request.search_type == 'fact'}")
+        print(f"[DEBUG] search_type == 'network': {request.search_type == 'network'}")
+        print(f"[DEBUG] flow_step is truthy: {bool(request.flow_step)}")
+
+        # 1. RAG検索ボタンが押された場合を最優先で処理
+        if request.search_type == "fact":
+            if not (embedding_model and index):
+                ai_content = "申し訳ございませんが、現在RAG検索機能は利用できません。環境設定を確認してください。"
+                sources = []
+            else:
+                ai_content, sources = perform_rag_search(request.content)
+            
+            if request.session_id and flexible_policy_system and hasattr(flexible_policy_system, "add_fact_search_result"):
+                try:
+                    flexible_policy_system.add_fact_search_result(request.session_id, ai_content)
+                except Exception as e:
+                    print(f"Warning: Failed to add fact search result: {e}")
+
+            # RAG結果をDBに保存（検索クエリ＋出典）
+            try:
+                session_id, step_id = _ensure_chat_session(sid, request.project_id, request.flow_step)
+                # rag_search_results は project_id, step_id が NOT NULL のため、揃っている時のみ保存
+                if request.project_id and step_id:
+                    _execute_query(
+                        """
+                        INSERT INTO rag_search_results
+                          (id, project_id, step_id, session_id, query, result_text, result_json, sources_json, created_by, created_at)
+                        VALUES
+                          (%s, %s, %s, %s, %s, %s, NULL, %s, NULL, CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            str(uuid.uuid4()),
+                            request.project_id,
+                            step_id,
+                            session_id,
+                            request.content,
+                            ai_content,
+                            json.dumps(sources, ensure_ascii=False),
+                        ),
+                    )
+            except Exception as e:
+                print(f"WARN: failed to save rag_search_results: {e}")
+
+        # 2. 人脈検索ボタンが押された場合（search_typeを優先）
+        elif request.search_type == "network":
+            print(f"[DEBUG] Network search triggered for: '{request.content}'")
+            # 人脈検索の実装
+            try:
+                # 既存の人脈検索APIを内部的に呼び出し
+                req = PeopleSearchRequest(query=request.content, top_k=5, coworker_id=None)
+                safe_sql, raw_sql = _generate_and_sanitize_people_sql(
+                    req.query.strip(), req.top_k, req.coworker_id
+                )
+                rows = _execute_query_db2(safe_sql, None)
+                
+                if rows:
+                    candidates = []
+                    for r in rows:
+                        candidates.append({
+                            "id": r.get('id'),
+                            "name": r.get('name'),
+                            "company": r.get('company'),
+                            "title": r.get('title') or r.get('position', ''),
+                            "department": r.get('department'),
+                            "score": r.get('score', 0)
+                        })
+                    
+                    # 構造化データとして返す
+                    ai_content = {
+                        "type": "people_search_result",
+                        "query": request.content,
+                        "candidates": candidates[:5],
+                        "narrative": f"「{request.content}」に関連する人物を{len(candidates[:5])}名見つけました。"
+                    }
+                else:
+                    ai_content = {
+                        "type": "people_search_result", 
+                        "query": request.content,
+                        "candidates": [],
+                        "narrative": f"「{request.content}」に関連する人物が見つかりませんでした。別のキーワードで検索してみてください。"
+                    }
+                    
+            except Exception as e:
+                print(f"People search failed: {e}")
+                ai_content = f"人脈検索中にエラーが発生しました。通常のチャットで対応します。\n\n質問: {request.content}"
+                if chat:
+                    ai_content = perform_normal_chat(request.content)
+
+        # 3. 政策立案ステップのボタンが押された場合
+        elif request.flow_step:
+            if not flexible_policy_system:
+                ai_content = "申し訳ございませんが、現在政策立案機能は利用できません。環境設定を確認してください。"
+            else:
+                session_id = request.session_id or str(uuid.uuid4())
+                project_id = request.project_id
+                
+                try:
+                    result = flexible_policy_system.process_flexible(
+                        request.content,
+                        session_id,
+                        request.flow_step,
+                        project_id
+                    )
+                except Exception as e:
+                    print(f"Error in flexible_policy_system.process_flexible: {e}")
+                    result = {"error": "政策立案処理中にエラーが発生しました。"}
+                
+                if "error" in result:
+                    ai_content = result["error"]
+                else:
+                    ai_content = result["result"]
+            
+        # 4. 通常のチャット
+        else:
+            print(f"[DEBUG] Normal chat triggered for: '{request.content}', search_type='{request.search_type}'")
+            if not chat:
+                ai_content = "申し訳ございませんが、現在チャット機能は利用できません。環境設定を確認してください。"
+            else:
+                ai_content = perform_normal_chat(request.content, request.session_id)
+        
+        # ai_contentが辞書型（人脈検索結果）の場合はJSONとして処理
+        if isinstance(ai_content, dict):
+            ai_message = MessageResponse(
+                id=str(uuid.uuid4()),
+                content=json.dumps(ai_content, ensure_ascii=False),
+                type="ai",
+                timestamp=datetime.now().isoformat(),
+                search_type=request.search_type
+            )
+        else:
+            ai_message = MessageResponse(
+                id=str(uuid.uuid4()),
+                content=ai_content,
+                type="ai",
+                timestamp=datetime.now().isoformat(),
+                search_type=request.search_type
+            )
+        # DB保存: AIメッセージ（辞書型の場合はJSON文字列として保存）
+        db_content = json.dumps(ai_content, ensure_ascii=False) if isinstance(ai_content, dict) else ai_content
+        _save_chat_message(session_id, request.project_id, step_id, 'ai', request.search_type or 'normal', db_content)
+        
+        return UTF8JSONResponse(ai_message.dict())
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/policy-flexible", response_model=FlexiblePolicyResponse)
+async def flexible_policy_endpoint(request: MessageRequest):
+    """柔軟な政策立案エンドポイント"""
+    try:
+        if not request.flow_step:
+            raise HTTPException(status_code=400, detail="flow_step is required")
+        
+        if not flexible_policy_system:
+            raise HTTPException(status_code=503, detail="Policy system not available. Please check environment configuration.")
+        
+        session_id = request.session_id or str(uuid.uuid4())
+        project_id = request.project_id
+        
+        try:
+            result = flexible_policy_system.process_flexible(
+                request.content,
+                session_id,
+                request.flow_step,
+                project_id
+            )
+        except Exception as e:
+            print(f"Error in flexible_policy_system.process_flexible: {e}")
+            raise HTTPException(status_code=500, detail="政策立案処理中にエラーが発生しました。")
+        
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+        
+        response = FlexiblePolicyResponse(
+            id=str(uuid.uuid4()),
+            content=result["result"],
+            step=result["step"],
+            timestamp=datetime.now().isoformat(),
+            session_id=session_id,
+            project_id=project_id,
+            navigate_to=result.get("navigate_to"),  # ステップ移動情報
+            type=result.get("type"),                # レスポンスタイプ
+            full_state=result["full_state"]
+        )
+
+        # DB保存: セッション確保とメッセージ保存
+        session_id, step_id = _ensure_chat_session(session_id, project_id, request.flow_step)
+        _save_chat_message(session_id, project_id, step_id, 'user', 'normal', request.content)
+        _save_chat_message(session_id, project_id, step_id, 'ai', 'normal', result["result"]) 
+        
+        return UTF8JSONResponse(response.dict())
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/session-state/{session_id}", response_model=SessionStateResponse)
+async def get_session_state(session_id: str):
+    """セッション状態を取得"""
+    try:
+        state = flexible_policy_system.get_session_state(session_id)
+        
+        if "error" in state:
+            raise HTTPException(status_code=404, detail=state["error"])
+        
+        return SessionStateResponse(**state)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/sessions", response_model=List[ChatSession])
+async def get_sessions():
+    """セッション一覧を取得"""
+    return list(sessions.values())
+
+@app.post("/api/sessions", response_model=ChatSession)
+async def create_session():
+    """新しいセッションを作成"""
+    session_id = str(uuid.uuid4())
+    now = datetime.now()
     
+    session = ChatSession(
+        id=session_id,
+        title=f"新しいチャット {now.strftime('%Y-%m-%d %H:%M')}",
+        created_at=now.isoformat(),
+        updated_at=now.isoformat()
+    )
+    
+    sessions[session_id] = session
+    return session
+
+@app.post("/api/project-step-sections", response_model=List[ProjectStepSectionResponse])
+async def save_step_sections(request: ProjectStepSectionRequest):
+    """プロジェクトステップセクションを保存"""
+    try:
+        print(f"DEBUG: Received request: project_id={request.project_id}, step_key={request.step_key}, sections_count={len(request.sections)}")
+        print(f"DEBUG: Request sections: {request.sections}")
+        
+        saved_sections = save_project_step_sections(request.project_id, request.step_key, request.sections)
+        
+        # セクション保存後にキャッシュを無効化
+        try:
+            from DB.mysql_crud import invalidate_project_cache
+            invalidate_project_cache(request.project_id)
+        except Exception as e:
+            print(f"Warning: Cache invalidation failed: {e}")
+        
+        print(f"DEBUG: Successfully saved {len(saved_sections)} sections")
+        return UTF8JSONResponse([ProjectStepSectionResponse(**section).dict() for section in saved_sections])
+    except CRUDError as e:
+        print(f"DEBUG: CRUDError occurred: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        print(f"DEBUG: Exception occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/project-step-sections/{project_id}/{step_key}", response_model=List[ProjectStepSectionResponse])
+async def get_step_sections(project_id: str, step_key: str):
+    """プロジェクトステップセクションを取得"""
+    try:
+        sections = get_project_step_sections(project_id, step_key)
+        return UTF8JSONResponse([ProjectStepSectionResponse(**section).dict() for section in sections])
+    except CRUDError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/project-all-sections/{project_id}")
+async def get_project_all_sections_endpoint(project_id: str):
+    """プロジェクトの全ステップセクションを一括取得（高速化）"""
+    try:
+        from DB.mysql_crud import MySQLCRUD
+        crud = MySQLCRUD()
+        sections_by_step = crud.get_project_all_step_sections(project_id)
+        return UTF8JSONResponse(sections_by_step)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/coworkers/search", response_model=List[CoworkerResponse])
+async def search_coworkers_endpoint(q: str = "", department: str = ""):
+    """coworkers検索"""
+    try:
+        coworkers = search_coworkers(q, department)
+        return UTF8JSONResponse([CoworkerResponse(**coworker).dict() for coworker in coworkers])
+    except CRUDError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/projects", response_model=ProjectResponse)
+async def create_project_endpoint(request: ProjectCreateRequest):
+    """プロジェクト作成"""
+    try:
+        project = create_project(
+            request.name, 
+            request.description or "", 
+            request.owner_coworker_id, 
+            request.member_ids
+        )
+        if not project:
+            raise HTTPException(status_code=400, detail="Failed to create project")
+        
+        return UTF8JSONResponse(ProjectResponse(**project).dict())
+    except CRUDError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/projects/{project_id}", response_model=ProjectResponse)
+async def get_project_endpoint(project_id: str):
+    """プロジェクト詳細取得"""
+    try:
+        project = get_project_by_id(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        return UTF8JSONResponse(ProjectResponse(**project).dict())
+    except CRUDError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/projects/by-coworker/{coworker_id}", response_model=List[ProjectResponse])
+async def get_projects_by_coworker_endpoint(coworker_id: int):
+    """coworkerが参加しているプロジェクト一覧取得"""
+    try:
+        projects = get_projects_by_coworker(coworker_id)
+        return UTF8JSONResponse([ProjectResponse(**project).dict() for project in projects])
+    except CRUDError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =====================
-# 人脈検索エンドポイント
+# 認証エンドポイント
 # =====================
+
+@app.post("/api/auth/login", response_model=LoginResponse)
+async def login_endpoint(request: LoginRequest, response: Response):
+    """ログインエンドポイント"""
+    try:
+        return await auth_service.login(request, response)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/auth/logout")
+async def logout_endpoint(response: Response):
+    """ログアウトエンドポイント"""
+    try:
+        await auth_service.logout(response)
+        return {"message": "Successfully logged out"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/auth/me")
+async def get_current_user_endpoint(access_token: str = Cookie(None)):
+    """現在のログインユーザー情報を取得"""
+    try:
+        user = await auth_service.get_current_user(access_token)
+        if not user:
+            raise HTTPException(status_code=401, detail="認証が必要です")
+        return user
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/auth/verify")
+async def verify_token_endpoint(access_token: str = Cookie(None)):
+    """トークンの有効性を確認"""
+    try:
+        user = await auth_service.get_current_user(access_token)
+        if not user:
+            return {"valid": False}
+        return {"valid": True, "user": user}
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
+@app.get("/")
+async def root():
+    """ルートエンドポイント"""
+    return {"message": "AI Agent API is running"}
+
+if __name__ == "__main__":
+    import uvicorn
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+# 旧 /api/me は削除（認証ベースの /api/auth/me に統合済み）
+# =====================
+# People Search (LLM→SQL with JOINs) ここから
+# =====================
+from pydantic import Field  # 再import可
+import re as _re
+import json as _json  # 使わなくてもOK（デバッグ用）
 
 # LLM に使わせてよいテーブルとカラムを明示（これ以外は不可）
 ALLOWED_TABLES = {
