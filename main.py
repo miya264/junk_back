@@ -91,10 +91,11 @@ origins = [
     # 必要に応じて他のオリジンを追加
 ]
 
-# CORS設定
+# CORS設定 - ローカル開発とAzure両対応
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        # ローカル開発
         "http://localhost:3000",
         "http://localhost:3001", 
         "http://localhost:3002",
@@ -105,8 +106,12 @@ app.add_middleware(
         "http://127.0.0.1:3002", 
         "http://127.0.0.1:3003",
         "http://127.0.0.1:3004",
+        # Azure デプロイ環境（実際のURL）
         "https://apps-junk-02.azurewebsites.net",
+        "https://aps-junk-01-fbgncnexhuekadft.canadacentral-01.azurewebsites.net",
+        "https://apps-junk-01.azurewebsites.net",
     ],
+    allow_origin_regex=r"https://.*\.azurewebsites\.net",  # Azure動的URLパターン
     allow_credentials=True,  # クッキー認証に必要
     allow_methods=["*"],
     allow_headers=["*"],
