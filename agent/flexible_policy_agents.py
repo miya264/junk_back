@@ -1,50 +1,36 @@
-# -*- coding: utf-8 -*-
-
 from typing import Dict, List, Optional, TypedDict, Any
 from datetime import datetime
 import re
+import asyncio
 
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain.schema import SystemMessage, HumanMessage
 
-# =========================
-# DB 抽象（既存そのまま）
-# =========================
 class SectionRepo:
-    def get_sections(self, project_id: str, step_key: str) -> List[Dict[str, Any]]:
+    async def get_sections(self, project_id: str, step_key: str) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
 class CrudSectionRepo(SectionRepo):
     def __init__(self, crud_module):
         self.crud = crud_module
 
-    def get_sections(self, project_id: str, step_key: str) -> List[Dict[str, Any]]:
-        if hasattr(self.crud, "fetch_project_step_sections"):
-            return self.crud.fetch_project_step_sections(project_id, step_key)
-        if hasattr(self.crud, "get_project_step_sections"):
-            return self.crud.get_project_step_sections(project_id, step_key)
-        return []
+    async def get_sections(self, project_id: str, step_key: str) -> List[Dict[str, Any]]:
+        return await self.crud.fetch_project_step_sections(project_id, step_key)
 
 class ChatRepo:
-    def get_recent_messages(self, session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    async def get_recent_messages(self, session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
 class CrudChatRepo(ChatRepo):
     def __init__(self, crud_module):
         self.crud = crud_module
 
-    def get_recent_messages(self, session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-        if hasattr(self.crud, "get_recent_chat_messages"):
-            return self.crud.get_recent_chat_messages(session_id, limit)
-        return []
+    async def get_recent_messages(self, session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        return await self.crud.get_recent_chat_messages(session_id, limit)
 
-# =========================
-# ステップ定義（ゴールはスコープを厳格化）
-# =========================
 STEP_ORDER = ["analysis", "objective", "concept", "plan", "proposal"]
 
-# ステップ名 → step_key のゆるいマッチ（日本語/英語/省略語）
 STEP_NAME_ALIASES = {
     "analysis": ["現状分析", "課題整理"],
     "objective": ["目的整理"],
@@ -52,7 +38,6 @@ STEP_NAME_ALIASES = {
     "plan": ["施策検討", "施策立案"],
     "proposal": ["提案資料", "資料作成"],
 }
-
 
 STEP_SECTIONS = {
     "analysis": [
@@ -90,7 +75,6 @@ STEP_CONFIG = {
             "背景にある構造（制度・市場・慣行など）が仮説化されている",
             "優先度と着手順が説明できる",
         ],
-        # 重要：ここでは施策検討に入らない指示を明記
         "persona": (
             "課題整理と現状分析の専門家。自然体の敬体で伴走。断定しすぎない。"
             " このフェーズでは施策/解決案の詳細には入らず、現状の把握と課題の特定・裏付けに専念する。"
@@ -142,28 +126,19 @@ STEP_CONFIG = {
 
 EXPLICIT_REFERENCE = True
 
-# =========================
-# ゲート閾値
-# =========================
 MIN_TURNS_FOR_STRUCTURE = 3
-MIN_TURNS_FOR_CAPTURE   = 4
-MIN_TURNS_FOR_BRIDGE    = 6
-MIN_CHARS_FOR_CAPTURE   = 120
-MIN_RECENT_CHARS        = 200
+MIN_TURNS_FOR_CAPTURE = 4
+MIN_TURNS_FOR_BRIDGE = 6
+MIN_CHARS_FOR_CAPTURE = 120
+MIN_RECENT_CHARS = 200
 
-# =========================
-# 追加：ファクト提示テンプレ
-# =========================
-# ステップ別：誰に/何を集めると良いかの“具体カテゴリ”ガイダンス（プレースホルダ禁止）
 FACT_GUIDANCE = {
     "analysis": [
-        # 人（誰に聞くか）
         "現場オペレーター（例：受発注・窓口・経理補助など）",
         "現場のリーダー/班長・係長クラス（業務の詰まり所の把握者）",
         "情報システム/総務・庶務（帳票/ツール/権限の実務を知る人）",
         "主要な取引先/委託先の担当（FAX/紙依存の理由を持つ相手側）",
         "商工会・業界団体/地域金融機関（横断的な事情に詳しい組織）",
-        # データ（何を集めるか）
         "処理時間・処理件数・エラー/差し戻し件数（業務ログ/紙台帳）",
         "紙・FAX比率、再入力件数、二重入力の発生頻度",
         "在庫回転・受発注リードタイム・納期遅延率",
@@ -171,42 +146,34 @@ FACT_GUIDANCE = {
         "人員構成・経験年数・研修受講状況（基礎スキル把握）",
     ],
     "objective": [
-        # 人
         "KPIのオーナー/管理者（部門長・経営企画）、データ管理者",
         "評価を受ける現場側（KPIが業務に与える負荷を確認）",
-        # データ
         "KPI候補：紙書類比率、再入力率、処理リードタイム、エラー率、教育受講率、システム定着率（MAU/週次利用率）",
         "計測可能性：取得経路（業務ログ/在庫・会計/CSツール/勤怠）と更新頻度・欠測",
         "ベンチマーク：類似施策の達成水準、業界統計の中央値",
     ],
     "concept": [
-        # 人
         "想定ターゲットの利用者/中小企業の担当者（価値仮説への共感度）",
         "専門家/先行事例の担当者（成功・失敗要因の裏取り）",
-        # データ
         "ユーザー課題の頻度と深刻度、代替手段の満足度/費用",
         "国内外の先行事例（導入条件・スイッチングコスト・リスク）",
     ],
     "plan": [
-        # 人
         "パイロットに協力可能な現場/地域・IT担当",
         "外部ベンダ/ツール提供者（見積・PoC条件）",
-        # データ
         "パイロット設計：対象セグメント、期間、成功指標（例：処理時間/再入力率/定着率）",
         "概算コスト（初期/運用）と想定効果（時間削減・事故削減・満足度）",
     ],
     "proposal": [
-        # 人
         "意思決定者/財務、リスク管理、現場代表（関心点の擦り合わせ）",
-        # データ
         "費用対効果（投資回収期間/ROI）、主要リスクの発生確率と影響、体制稼働（FTE）",
     ],
 }
 
+_SOLUTION_WORDS = re.compile(
+    r"(施策|ソリューション|導入|実装|PoC|ロードマップ|KPI改善案|予算配分|体制案|稟議|スケジュール|ツール選定|システム|ツール|IT化|RPA|SaaS|パッケージ)"
+)
 
-# =========================
-# ヘルパ
-# =========================
 def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
@@ -232,58 +199,32 @@ def _score(known: str, gaps: str) -> int:
     sc += 40 if (0 < len(gaps) <= 120) else 20
     return max(0, min(100, sc))
 
-# 施策/解決案への“はみ出し”検知（特にanalysisで無効化）
-_SOLUTION_WORDS = re.compile(
-    r"(施策|ソリューション|導入|実装|PoC|ロードマップ|KPI改善案|予算配分|体制案|稟議|スケジュール|ツール選定|システム|ツール|IT化|RPA|SaaS|パッケージ)"
-)
-
-
 def _has_solution_leak(text: str) -> bool:
     return bool(_SOLUTION_WORDS.search(text or ""))
 
 def _scope_guard(step: str, text: str) -> str:
-    """analysis で施策/システム系の語が出たら、やんわり弱めて注意書きを付ける"""
     if step != "analysis":
         return text
     if not _has_solution_leak(text):
         return text
-
-    # 『導入/実装/システム/ツール…』を『仮に◯◯』へ弱める
     softened = re.sub(r"(導入|実装|施策|ソリューション|システム|ツール)", r"仮に\1", text)
-
-    note = (
-        "（※ 今は現状と課題の裏付けに専念し、解決策の細部は後工程で扱います）"
-    )
+    note = "（※ 今は現状と課題の裏付けに専念し、解決策の細部は後工程で扱います）"
     if note not in softened:
         softened += "\n" + note
     return softened
 
-
-# =========================
-# 状態
-# =========================
 class FlexiblePolicyState(TypedDict):
     session_id: str
     project_id: Optional[str]
     last_updated_step: Optional[str]
     step_timestamps: Dict[str, str]
-    conversation_history: List[Dict[str, str]]   # [{role, content}]
+    conversation_history: List[Dict[str, str]]
     ask_cooldown: int
     last_move: str
-    step_completion: Dict[str, int]              # 進捗スコア（0-100）
+    step_completion: Dict[str, int]
     last_result: Optional[str]
 
-# =========================
-# 本体
-# =========================
 class FlexiblePolicyAgentSystem:
-    """
-    - 自然会話：要約→示唆→軽い確認/提案（最大5文）
-    - 自動ミニ整理：見えている/足りない/次の一歩/（NEW）必要なファクト/収集方法
-    - 保存促し：材料が十分な時のみ、保存先セクションを明示
-    - 横断前提：全ステップの保存済み内容を圧縮して文脈注入
-    - スコープ遵守：analysis では施策詳細へ踏み込まない（ガード）
-    """
 
     def __init__(self, chat_model: ChatOpenAI, section_repo: Optional[SectionRepo]=None, chat_repo: Optional[ChatRepo]=None):
         self.chat = chat_model
@@ -291,7 +232,6 @@ class FlexiblePolicyAgentSystem:
         self.chat_repo = chat_repo
         self.state_storage: Dict[str, FlexiblePolicyState] = {}
 
-    # -------- 状態 ------
     def _get_state(self, session_id: str, project_id: Optional[str]) -> FlexiblePolicyState:
         st = self.state_storage.get(session_id)
         if not st:
@@ -332,13 +272,12 @@ class FlexiblePolicyAgentSystem:
         st["last_move"] = last_move
         st["ask_cooldown"] = 2 if last_move=="ask" else max(0, st["ask_cooldown"]-1)
 
-    # -------- 文脈（横断＋現ステップ詳細） ------
-    def _cross_context(self, st: FlexiblePolicyState) -> str:
+    async def _cross_context(self, st: FlexiblePolicyState) -> str:
         if not (self.section_repo and st.get("project_id")):
             return ""
         blocks = []
         for step in STEP_ORDER:
-            rows = self.section_repo.get_sections(st["project_id"], step)
+            rows = await self.section_repo.get_sections(st["project_id"], step)
             if not rows:
                 continue
             ex = []
@@ -350,10 +289,10 @@ class FlexiblePolicyAgentSystem:
                 blocks.append(f"◆{STEP_CONFIG[step]['title']}\n・" + "\n・".join(ex[:3]))
         return "\n\n".join(blocks)
 
-    def _step_context(self, st: FlexiblePolicyState, step: str) -> str:
+    async def _step_context(self, st: FlexiblePolicyState, step: str) -> str:
         if not (self.section_repo and st.get("project_id")):
             return ""
-        rows = self.section_repo.get_sections(st["project_id"], step)
+        rows = await self.section_repo.get_sections(st["project_id"], step)
         if not rows: return ""
         bl = []
         for r in rows:
@@ -363,25 +302,23 @@ class FlexiblePolicyAgentSystem:
             bl.append(f"■{label}\n{txt[:280]}")
         return "\n\n".join(bl)
 
-    def _build_context(self, st: FlexiblePolicyState, step: str) -> str:
+    async def _build_context(self, st: FlexiblePolicyState, step: str) -> str:
         chunks = []
         hist = st["conversation_history"][-8:]
         if hist:
             talk = "\n".join([f"【{m['role']}】{_clean(m['content'])}" for m in hist if m.get("content")])
             chunks.append("【直近の会話】\n" + talk)
-        cross = self._cross_context(st)
+        cross = await self._cross_context(st)
         if cross:
             chunks.append("【保存済みの横断前提】\n" + cross)
-        now = self._step_context(st, step)
+        now = await self._step_context(st, step)
         if now:
             chunks.append("【現在ステップの整理】\n" + now)
         return "\n\n".join(chunks)
 
-    # -------- 会話生成（自然体＋スコープ明示） ------
-    def _chat_reply(self, step: str, user_input: str, st: FlexiblePolicyState) -> str:
+    async def _chat_reply(self, step: str, user_input: str, st: FlexiblePolicyState) -> str:
         cfg = STEP_CONFIG[step]
         lane_note = " ※このステップの範囲から逸脱しないでください。" if cfg.get("stay_in_lane") else ""
-        # ★ analysis のときだけ強めの禁止文言を追加
         analysis_guard = (
             " 特にこの analysis（現状分析・課題整理）では、システムやツール等の導入・実装・施策の詳細には入らないでください。"
             " 要望があっても丁寧に保留し、現状の事実・課題・根拠（誰が/何が/どれくらい）に集中してください。"
@@ -410,15 +347,13 @@ class FlexiblePolicyAgentSystem:
         )
         msgs = [
             SystemMessage(content=sys),
-            HumanMessage(content=prompt.format(title=cfg["title"], context=self._build_context(st, step), user_input=user_input)),
+            HumanMessage(content=prompt.format(title=cfg["title"], context=await self._build_context(st, step), user_input=user_input)),
         ]
-        out = self.chat.invoke(msgs).content.strip()
-        return _scope_guard(step, out)
+        out = await self.chat.ainvoke(msgs)
+        return _scope_guard(step, out.content.strip())
 
-    # -------- ミニ整理（自動/内部用）：ファクト欄を追加 ------
-    def _mini_structure(self, step: str, user_input: str, st: FlexiblePolicyState) -> Dict[str,str]:
+    async def _mini_structure(self, step: str, user_input: str, st: FlexiblePolicyState) -> Dict[str,str]:
         cfg = STEP_CONFIG[step]
-        # ステップ別ガイダンス（プレースホルダなしのカテゴリ群）
         guidance_lines = FACT_GUIDANCE.get(step, [])
         guidance_block = "・" + "\n・".join(guidance_lines) if guidance_lines else ""
 
@@ -456,15 +391,14 @@ class FlexiblePolicyAgentSystem:
             SystemMessage(content="出力は日本語。各ブロックは見出し＋本文（1〜3行）。このステップの範囲から逸脱しない。"),
             HumanMessage(content=tmpl.format(
                 title=cfg["title"],
-                context=self._build_context(st, step),
+                context=await self._build_context(st, step),
                 user_input=user_input,
                 guidance=guidance_block
             )),
         ]
-        raw = self.chat.invoke(msgs).content.strip()
-        raw = _scope_guard(step, raw)
+        raw = await self.chat.ainvoke(msgs)
+        raw_content = _scope_guard(step, raw.content.strip())
 
-        # ---- ここから「out」を作って埋める（重要：省略しない）----
         pats = {
             "tldr":  r"^\s*1\).*?$([\s\S]*?)(?=^\s*2\)|^\Z)",
             "known": r"^\s*2\).*?$([\s\S]*?)(?=^\s*3\)|^\Z)",
@@ -475,26 +409,23 @@ class FlexiblePolicyAgentSystem:
         }
         out: Dict[str, str] = {k: "" for k in pats}
         for k, pat in pats.items():
-            m = re.search(pat, raw, flags=re.MULTILINE)
+            m = re.search(pat, raw_content, flags=re.MULTILINE)
             if m:
                 out[k] = m.group(1).strip()
 
-        # ---- フォールバック（空を許さない）----
         if not out["known"]:
-            out["known"] = _bullets_any(raw, 3)
+            out["known"] = _bullets_any(raw_content, 3)
         if not out["gaps"]:
-            out["gaps"] = _bullets_any(raw, 3)
+            out["gaps"] = _bullets_any(raw_content, 3)
         if not out["facts"]:
             out["facts"] = "関係者の証言・業務ログ・既存統計・実地観察など、裏付けファクトが未取得。"
         if not out["how"]:
             out["how"] = ("現場担当/管理職/情報システム/主要取引先に半構造化インタビュー。"
                           "業務ログ（処理時間/件数/エラー率）や在庫・受発注データを期間指定で抽出し、"
                           "チャネル別件数等を集計する。")
-        # 「確認の問い」も用意（呼び出し側で使う）
-        qs = [ln.strip() for ln in raw.splitlines() if ln.strip().endswith(("？", "?"))]
+        qs = [ln.strip() for ln in raw_content.splitlines() if ln.strip().endswith(("？", "?"))]
         out["q"] = qs[-1] if qs else "いま決めるなら、最小の次の一歩は何にしますか？"
 
-        # 「次の一歩」が空なら合成
         if not out["next"]:
             out["next"] = self._synthesize_next(step, out)
 
@@ -505,10 +436,8 @@ class FlexiblePolicyAgentSystem:
                 out["tldr"] = "要点を整理中。"
 
         return out
-
     
     def _synthesize_next(self, step: str, parsed: Dict[str, str]) -> str:
-        # facts/how から一歩を組み立て（会話が薄くても空にならないようにする）
         def first_line(s: str) -> str:
             for ln in (s or "").splitlines():
                 t = ln.lstrip("・-*—").strip()
@@ -526,7 +455,6 @@ class FlexiblePolicyAgentSystem:
         if f:
             return f"最重要ファクト（例：{f}）の入手先と取得可否を関係者に確認する。"
 
-        # それでも材料が薄い場合のデフォルト（ステップ別）
         defaults = {
             "analysis":  "現場1部署を選び、業務フロー観察（半日）＋担当者ヒアリング（15分×2名）を実施する。",
             "objective": "最終ゴールの草案を1文で作り、関係者2名からフィードバックを得る。",
@@ -536,12 +464,11 @@ class FlexiblePolicyAgentSystem:
         }
         return defaults.get(step, "最小の次の一歩を決める。")
 
-
-    # -------- 保存候補の提示（analysisに事実欄を厚めに） ------
-    def _capture_candidates(self, st: FlexiblePolicyState, step: str, parsed: Dict[str,str]) -> str:
+    async def _capture_candidates(self, st: FlexiblePolicyState, step: str, parsed: Dict[str,str]) -> str:
         if not (self.section_repo and st.get("project_id")):
             return ""
-        rows = self.section_repo.get_sections(st["project_id"], step)
+        
+        rows = await self.section_repo.get_sections(st["project_id"], step)
         existing = {r["section_key"]: (r.get("content_text") or r.get("content") or "") for r in rows}
 
         mapping = {
@@ -560,26 +487,19 @@ class FlexiblePolicyAgentSystem:
         for sec in STEP_SECTIONS.get(step, []):
             key, label = sec["key"], sec["label"]
             already = (existing.get(key) or "").strip()
-            draft = (mapping.get(key) or "").strip()
-
-            # ここを修正：空 or 閾値未満でも必ず見出しを出す
             if already:
-                continue  # 既にDBに保存済みなら候補は出さない
+                continue
 
+            draft = (mapping.get(key) or "").strip()
             if not draft or len(draft) < MIN_CHARS_FOR_CAPTURE:
                 draft = "関係者の証言・業務ログ・既存統計・実地観察など、裏付けファクトが未取得。"
-
             blocks.append(f"### {label}\n{draft}")
 
         if not blocks:
             return ""
         return "— 必要なら、下記を**内容整理**に貼り付けて保存してください。\n" + "\n\n".join(blocks)
 
-
-
-    # -------- 次ステップ橋渡し ------
-    def _bridge(self, current_step: str, score: int, st: FlexiblePolicyState) -> str:
-        """十分に整理できたときだけ、次ステップ名を明示して質問する"""
+    async def _bridge(self, current_step: str, score: int, st: FlexiblePolicyState) -> str:
         if score < 80:
             return ""
         if self._turns(st) < MIN_TURNS_FOR_BRIDGE:
@@ -593,27 +513,19 @@ class FlexiblePolicyAgentSystem:
             f"ここまでの整理は十分に形になってきました。次は「{next_title}」に進みますか？\n"
             f"（『はい』『進みます』『お願いします』で移動します。続けてこのステップを深掘りする場合は『このまま』等で続行します）"
         )
-
-
-
-    # -------- メインAPI（既存互換） ------
-    def process_flexible(self, user_input: str, session_id: str, current_step: str, project_id: str=None) -> Dict[str, Any]:
-        # 1) ステップ妥当化
+    
+    async def process_flexible(self, user_input: str, session_id: str, current_step: str, project_id: str=None) -> Dict[str, Any]:
         if current_step not in STEP_CONFIG:
             current_step = "analysis"
-        # 2) セッション状態を先に取得（← st を先に用意）
         st = self._get_state(session_id, project_id)
 
-        # 3) ステップ移動の意図を検出（← ここで st を使う）
-        target_step = self._detect_step_switch_intent(user_input, st, current_step)
+        target_step = await self._detect_step_switch_intent(user_input, st, current_step)
         if target_step and target_step != current_step:
             msg = f"了解しました。{STEP_CONFIG[target_step]['title']}に移ります。"
-
-            # ★ 移行時にチャット履歴カウントをリセット
-            st["conversation_history"] = []         # 会話履歴クリア
-            st["ask_cooldown"] = 0                  # クールダウン解除
-            st["last_move"] = "advise"              # 状態を初期化
-            st["step_completion"][target_step] = 0  # 新ステップは進捗ゼロから
+            st["conversation_history"] = []
+            st["ask_cooldown"] = 0
+            st["last_move"] = "advise"
+            st["step_completion"][target_step] = 0
             
             self._log_exchange(st, current_step, user_input, msg)
             return {
@@ -625,8 +537,6 @@ class FlexiblePolicyAgentSystem:
                 "full_state": st,
             }
 
-
-        # 4) 以降は従来ロジック（保存合図→会話→整理…）
         t = (user_input or "").strip()
         if t in ["保存した","保存しました","保存完了"] or t.startswith("#保存"):
             msg = "ありがとうございます。内容が反映されました。この方針で続けますか？それとも修正しますか？"
@@ -634,19 +544,16 @@ class FlexiblePolicyAgentSystem:
             return {"result": msg, "step": current_step, "type": "save_confirm",
                     "progress": st["step_completion"].get(current_step, 0), "full_state": st}
 
-        # 通常の会話
-        reply = self._chat_reply(current_step, user_input, st)
+        reply = await self._chat_reply(current_step, user_input, st)
 
-        # 会話の厚みで自動ミニ整理（ファクト提案込み）
         tail = ""
         save_hint = ""
         bridge = ""
         progress = st["step_completion"].get(current_step, 0)
 
         if self._enough(st, MIN_TURNS_FOR_STRUCTURE, MIN_RECENT_CHARS):
-            parsed = self._mini_structure(current_step, user_input, st)
+            parsed = await self._mini_structure(current_step, user_input, st)
 
-            # ステップの“ゴール達成”に直結するミニ整理＋ファクト提案
             body = (
                 f"【{STEP_CONFIG[current_step]['title']}の要点】\n"
                 f"●見えていること\n{_two_bullets(parsed['known'])}\n\n"
@@ -658,17 +565,15 @@ class FlexiblePolicyAgentSystem:
             )
             tail += "\n\n" + body
 
-            # 保存促し（十分な材料時のみ）
             if self._enough(st, MIN_TURNS_FOR_CAPTURE, 300):
-                save_hint = self._capture_candidates(st, current_step, parsed)
+                save_hint = await asyncio.to_thread(self._capture_candidates, st, current_step, parsed)
                 if save_hint:
                     tail += "\n\n" + save_hint
 
-            # 橋渡し（十分な進捗時のみ）
             if self._enough(st, MIN_TURNS_FOR_BRIDGE, 450):
                 progress = _score(parsed["known"], parsed["gaps"])
                 st["step_completion"][current_step] = progress
-                bridge = self._bridge(current_step, progress, st)
+                bridge = await self._bridge(current_step, progress, st)
                 if bridge:
                     tail += "\n\n" + bridge
 
@@ -685,35 +590,22 @@ class FlexiblePolicyAgentSystem:
             "full_state": st,
         }
     
-        # ---- ユーザー入力から「ステップ移動」の意図を検出 ----
-    def _detect_step_switch_intent(self, user_input: str, st: FlexiblePolicyState, current_step: str) -> Optional[str]:
-        """
-        ステップ名（別名を含む） + 遷移を示す語（命令/希望/依頼）を同時検出して navigate を返す。
-        - 進む系: 移る/進む/行く/切替/… + ください/下さい を含む命令形も許容
-        - 依頼系: 「◯◯（作成/策定/検討）をお願いします」
-        - 戻る系: 「◯◯に戻る/戻ってください」「前のステップに戻る」
-        - 列挙対応: 「コンセプト策定、施策の検討に移ります」→ 動詞の直前に最も近いステップを採用
-        """
+    async def _detect_step_switch_intent(self, user_input: str, st: FlexiblePolicyState, current_step: str) -> Optional[str]:
         t = (user_input or "").strip()
         if not t:
             return None
         tl = t.lower()
-
-        # 明示コマンド（例：#移動 objective / #戻る analysis）
         m = re.search(r"#\s*(?:移動|move|戻る|back)\s+([a-z]+)", tl)
         if m:
             key = m.group(1)
             return key if key in STEP_CONFIG else None
 
-        # 言い回し（命令/希望/依頼）
         GO_CMDS   = r"(?:移る|移ります|移って(?:ください|下さい)?|進む|進める|進みたい|進んで(?:ください|下さい)?|行く|行きたい|行って(?:ください|下さい)?|切り替える|切替える|切替|切り替えて(?:ください|下さい)?|入る|入りたい|入って(?:ください|下さい)?|開始する|開始したい)"
         WANT_CMDS = r"(?:したい|やりたい|行いたい|始めたい|取り組みたい|進めたい)"
-        ASK_CMDS  = r"(?:お願いします|お願い致します|お願いいたします|お願い)?"  # 依頼語は単独では無効。必ずステップ語と結合して判定
+        ASK_CMDS  = r"(?:お願いします|お願い致します|お願いいたします|お願い)?"
         MAKE_NOUN = r"(?:作成|策定|検討)"
-
         BACK_CMDS = r"(?:戻る|戻ります|戻りたい|戻って(?:ください|下さい)?|戻して(?:ください|下さい)?|戻れます(?:か)?|戻してほしい)"
 
-        # --- ひとつ前に戻る ---
         if re.search(r"(?:前|ひとつ前|直前)のステップに?\s*" + BACK_CMDS, t):
             try:
                 idx = STEP_ORDER.index(current_step)
@@ -721,8 +613,7 @@ class FlexiblePolicyAgentSystem:
                     return STEP_ORDER[idx - 1]
             except ValueError:
                 pass
-
-        # --- 「◯◯に戻る/戻ってください」 ---
+        
         for key, aliases in STEP_NAME_ALIASES.items():
             for a in aliases:
                 a_esc = re.escape(a)
@@ -730,20 +621,13 @@ class FlexiblePolicyAgentSystem:
                 if re.search(pat_back, t):
                     return key
 
-        # --- 進む／依頼（命令/希望/お願い） ---
-        # ルール：ステップ語（＋作成/策定/検討）＋（へ|に|を|、|空白 可）＋ GO_CMDS or WANT_CMDS or 「…をお願いします」
         matches: list[tuple[int, str]] = []
         for key, aliases in STEP_NAME_ALIASES.items():
             for a in aliases:
                 a_esc = re.escape(a)
-
-                # ① 「◯◯（作成/策定/検討）に進んでください／移る…」
                 pat1 = fr"{a_esc}\s*(?:{MAKE_NOUN})?\s*(?:へ|に)?\s*{GO_CMDS}"
-                # ② 「◯◯（作成/策定/検討）をしたい／行いたい…」
                 pat2 = fr"{a_esc}\s*(?:{MAKE_NOUN})?\s*(?:を|に)?\s*{WANT_CMDS}"
-                # ③ 「次は ◯◯」
                 pat3 = fr"(?:次は|次に)\s*{a_esc}"
-                # ④ 「◯◯（作成/策定/検討）をお願いします」
                 pat4 = fr"{a_esc}\s*(?:{MAKE_NOUN})?\s*(?:を)?\s*お願いします[。!！]?$"
 
                 for pat in (pat1, pat2, pat3, pat4):
@@ -751,39 +635,28 @@ class FlexiblePolicyAgentSystem:
                         matches.append((m.start(), key))
 
         if matches:
-            # 列挙文対応：動詞の直前/近傍が最後に出たステップであることが多いので、開始位置が最大のものを採用
             matches.sort(key=lambda x: x[0])
             return matches[-1][1]
         
-            # ---- 同意応答 + 直前の橋渡し提案から推定（新規追加）----
         if re.search(r"^(はい|了解|ok|お願いします|お願いいたします|お願い致します|進みます|次へ|進めよう|お願いします[。!！]?)$", t.strip(), re.IGNORECASE):
-            # 直近のアシスタント発話を取得
             last_assistant = ""
             for m in reversed(st["conversation_history"]):
                 if m.get("role") == "assistant":
                     last_assistant = m.get("content", "")
                     break
             if last_assistant:
-                # 1) 『次は「◯◯」に進みますか？』パターン
                 for key in STEP_ORDER:
                     title = STEP_CONFIG[key]["title"]
                     if re.search(fr"{re.escape(title)}に進みますか", last_assistant):
                         return key
-                # 2) 既存フォーマット『次は「◯◯」』にも対応
                 for key in STEP_ORDER:
                     title = STEP_CONFIG[key]["title"]
                     if f"次は「{title}」" in last_assistant:
                         return key
 
         return None
-
-    # 互換エイリアス
-    def process(self, *a, **kw): return self.process_flexible(*a, **kw)
-    def handle(self, *a, **kw):  return self.process_flexible(*a, **kw)
-    def run(self, *a, **kw):     return self.process_flexible(*a, **kw)
-
-    # 状態確認
-    def get_session_state(self, session_id: str) -> Dict[str, Any]:
+    
+    async def get_session_state(self, session_id: str) -> Dict[str, Any]:
         st = self.state_storage.get(session_id)
         if not st:
             return {"error": "セッションが見つかりません"}
@@ -794,6 +667,3 @@ class FlexiblePolicyAgentSystem:
             "step_timestamps": st["step_timestamps"],
             "step_completion": st["step_completion"],
         }
-
-
-		
